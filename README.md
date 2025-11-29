@@ -1,18 +1,18 @@
 # Infinite-Context Memory OS (ICMOS)
 
-> 💡 Research prototype: building an **infinite-context memory system** for 8B LLMs on a single consumer GPU + large host RAM.
+> 💡 Research prototype: building an **infinite-context memory system** for an 8B LLM on a **small 4× MI100 node + large host RAM**.
 
 This repo is an experiment in **treating KV cache as a first-class memory system**, not just a byproduct of attention.
 
 The long-term goal is to make a mid-size model (e.g. Qwen3-8B) able to:
 
-- Hold **100K–1M+ tokens of dialogue/history** on **one GPU (e.g. 3090/4090)** + host RAM  
+- Hold **100K–1M+ tokens of dialogue/history** on a **4× MI100 box + host RAM**  
 - Decide **what to remember / what to forget** at the **token level**  
 - Organize past context into **semantic memory blocks**  
 - Retrieve the right blocks later via **neural, differentiable retrieval** instead of brute-force scanning
 
-This is **not** another “we trained a 1M context model on a big cluster” project.  
-This is a **memory OS** on top of an existing LLM.
+This is **not** another “we trained a 1M context model on a huge TPU/GPUs cluster” project.  
+This is a **memory OS** on top of an existing LLM, targeting a **small 4-GPU node** rather than a hyperscale setup.
 
 ---
 
@@ -39,12 +39,12 @@ Most “long context” solutions today fall into one of these buckets:
 
 These approaches are very useful, but they don’t really answer:
 
-> “If an LLM had a *brain-like, layered memory system* on a single GPU,  
+> “If an LLM had a *brain-like, layered memory system* on a small 4-GPU node,  
 > what would that system look like?”
 
 This repo is my attempt to **prototype** such a system, end-to-end, in a way that is:
 
-- **Compute-realistic** (single consumer GPU + host RAM)
+- **Compute-realistic** (4× MI100 + large host RAM)
 - **Modular** (token-level, block-level, graph-level)
 - **Differentiable** where it matters (so the LLM can *learn how to recall*)
 
@@ -129,7 +129,7 @@ This repo is being built in **phases**, with the explicit goal that **each phase
 
 ### ✅ Phase 0: Plumbing & Baseline
 
-- [ ] Hook Qwen3-8B (or similar 7–8B model) into a **custom inference loop**
+- [ ] Hook Qwen3-8B (or similar 7–8B model) into a **custom inference loop** on a 4× MI100 node
 - [ ] Implement:
   - Basic **StreamingLLM-style sliding window + first-4 anchors** (baseline)
   - Simple **Host KV offload** (CPU-side KV store, GPU-side rolling window)
@@ -137,7 +137,7 @@ This repo is being built in **phases**, with the explicit goal that **each phase
   - Needle-in-a-Haystack / passkey tasks (64K–128K)
   - Long-dialogue QA / summarization
 
-> Output: a **reproducible baseline** for long-context on a single GPU.
+> Output: a **reproducible baseline** for long-context on a 4× MI100 machine.
 
 ---
 
@@ -198,7 +198,7 @@ This repo is being built in **phases**, with the explicit goal that **each phase
   - Demo scenarios
 
 > Output: a **working demo** + a blog:  
-> *“Building an Infinite-Context Memory OS for 8B LLMs on a Single GPU”*
+> *“Building an Infinite-Context Memory OS for 8B LLMs on a 4× MI100 Node”*
 
 ---
 
@@ -214,7 +214,7 @@ If you are interested in:
 
 - Long-context inference **beyond** just bigger windows  
 - Treating KV as **structured, trainable memory**  
-- Or just want to see how far a single GPU can go
+- Or just want to see how far a small **4× MI100** node can go
 
 …then this project is for you 🙂
 
