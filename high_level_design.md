@@ -184,371 +184,748 @@ In later phases, this graph becomes the substrate for **macro-level navigation**
 
 ---
 
-### 3.2 Phase 2: Algorithm I — Semantic Indexing (Core)
+### 3.2 Token-Level Memory Management: Summary Trigger & Trimmer
 
-**Goal:** Train the Trimmer, Q-Former, and retrieval projector so that the system can:
+At the **block level**, the system must decide:
 
-- **Read** historical context meaningfully,  
-- **Compress** it into reasoning-aware Detail Tokens, and  
-- **Retrieve** the right blocks with a learned query embedding.
+1. **When** to cut off the current stream and archive a block (summary trigger).  
+2. **Within that block**, **which tokens’ KV** remain on GPU and which can be safely evicted to host (Trimmer).
+
+This section defines the **token-level mechanisms** that sit *inside* each block:
+
+- A **learned summary trigger** (`<SUMMARIZE>`) that decides when a block should be closed and archived.  
+- A **Trimmer module** that learns, under a fixed KV budget, **which tokens are worth keeping** for future computation.
+
+> Q-Former, block-level summaries, and block handlers are covered later in **Section 3.3**.
 
 ---
 
-#### 3.2.1 Segmentation & Trimming Policy (Token-Level)
+#### 3.2.1 Summary Trigger & Block Segmentation
 
-**Strategy A: Context Trimmer with Stochastic Exploration**  
-(*Gumbel-based smart pruning*)
+The **summary trigger** is the junction between the **continuous token stream** and the **block-based memory system**.
 
-We introduce a **Trimmer** to learn **which tokens’ KV should be kept** under a fixed budget.
+We introduce a special control token:
 
-- **Mechanism: Straight-Through Gumbel-Softmax (STE)**
-  - Provide exploration via Gumbel noise.  
-  - Optimize the Trimmer by minimizing the **generation error** induced by trimming.
+- `<SUMMARIZE>` – a learned “segment boundary” marker.
 
-- **Trimmer model:**
-  - A lightweight **Scorer**:
-    - `LayerNorm -> Linear -> Linear`  
-  - Outputs raw logits `L_trim` over tokens.
+When `<SUMMARIZE>` fires at time step `t`:
 
-- **Training: Soft-to-Hard Distillation**
+1. The **current block** `[t_block_start, ..., t]` is finalized.  
+2. The block’s hidden states and KV become eligible for:
+   - Trimming (token-level KV selection).  
+   - Archival (block-level semantic compression, see Section 3.3).  
+3. The Memory OS:
+   - Updates anchors (Global / Local).  
+   - Starts a **new block** from `t+1`.
 
-  - **Sampling:**
-    - Apply Gumbel noise to `L_trim` and perform **multi-sample Top-K** sampling.  
-    - Obtain `N` different hard masks `M_hard`.
+The summary trigger is learned but backed by simple heuristics to guarantee robustness.
 
-  - **Parallel Forward (Simulation):**
-    - For each `M_hard`, simulate a **trimmed KV cache** (masking / zero-filling).  
-    - During training, no physical eviction; only logical masking.
+---
 
-  - **Loss function (end-to-end):**
-    - Teacher output: `Y_teacher` (logits from the full-context model)  
-    - Student output: `Y_student` (logits from trimmed context)  
+##### 3.2.1.1 Supervised Summary Trigger
 
+We provide **explicit supervision** for where `<SUMMARIZE>` *should* appear.
+
+**Data construction**
+
+For each long sequence (dialogue, document, code), we generate **segment boundaries** by:
+
+- Human / heuristic / LLM-based topic segmentation:
+  - Discourse boundaries (end of an answer, end of a paragraph).  
+  - Topic shifts (“now let’s talk about X”).  
+  - Completion of a logical unit (e.g., a function definition or a resolved QA pair).
+
+We then insert synthetic labels:
+
+- At each boundary position `t`, the target next token is `<SUMMARIZE>`.  
+- At non-boundary positions, `<SUMMARIZE>` is **not** in the target set.
+
+**Training**
+
+- The base LLM (optionally with a small LoRA head) is trained with **token-level CE** to predict `<SUMMARIZE>` at the correct boundaries.  
+- To avoid over-firing:
+  - We down-weight positive `<SUMMARIZE>` examples, or  
+  - Add a simple **frequency penalty** in the loss.
+
+At inference time, the model learns a **probability field over “should I summarize here?”**; the Memory OS then applies additional constraints.
+
+---
+
+##### 3.2.1.2 Heuristic Fallbacks & Safety Rails
+
+To avoid pathological behaviors (never summarizing / summarizing every few tokens), the Memory OS adds simple, **non-learned fallback rules**:
+
+- **Max block length**  
+  - If the current block exceeds `L_max` tokens and no `<SUMMARIZE>` fired,  
+    - force a segment cut.
+
+- **Min block length**  
+  - If `<SUMMARIZE>` fired too soon and the block is shorter than `L_min`,  
+    - ignore new `<SUMMARIZE>` triggers for a short cooldown window.
+
+- **Turn-based triggers (dialogue)**  
+  - In conversational settings, when a **user turn** ends and the block is reasonably long,  
+    - we can treat it as a soft segmentation hint.
+
+These rules guarantee that the system **always** produces reasonably sized blocks, even if the learned trigger is imperfect.
+
+---
+
+#### 3.2.2 Trimmer: Learning Which Tokens’ KV to Keep
+
+Once a block is cut, we must decide **which tokens’ KV states remain on GPU** and which can be safely evicted to host.
+
+Instead of:
+
+- Keeping a naive sliding window, or  
+- Only preserving the first 4 tokens as anchors,
+
+we train a **Trimmer module**:
+
+> A **soft Top-K KV selector** that, given the block’s hidden states, learns which tokens are truly important under a fixed KV budget.
+
+**Inputs**
+
+- Block hidden states:  
+  \[
+  H = [h_1, h_2, \dots, h_T], \quad h_t \in \mathbb{R}^{d_\text{model}}
+  \]
+- An optional **summary condition**:
+  - Either the hidden state at `<SUMMARIZE>` position,  
+  - Or a pooled representation of the block:
     \[
-    \mathcal{L}_\text{trim} = \alpha \cdot \mathcal{L}_\text{CE}(Y_{student}, Y_{target}) +
-    \beta \cdot \mathcal{L}_\text{Logit-KL}(Y_{student} \parallel Y_{teacher}) +
-    \gamma \cdot \mathcal{L}_\text{Attn-KL}(\text{Trimmer Logits} \parallel \text{Teacher Attn})
+    h_\text{sum} = \text{Pool}(H)
     \]
 
-    - Gumbel provides the exploration path.  
-    - The loss penalizes logit deviations induced by trimming.
+**Output**
 
-  - **Inference (physical trim):**
-    - At inference time, the Trimmer outputs logits → Top-K selection.  
-    - KV entries not selected are physically zeroed and evicted to host RAM.
-
----
-
-#### 3.2.2 Write-Side: Interpretation-Driven Dual-Phase Encoding
-
-We adopt an aggressive **“interpret first, distill later”** dual-phase architecture for block-level memory:
-
-> We do **not** train retrieval vectors directly.  
-> We first train a **reasoning-aware compressor** (Phase 1),  
-> then distill its outputs into compact retrieval indices (Phase 2).
+- A scalar **importance logit** `l_t` for each token.  
+- During training, these logits generate **soft masks**.  
+- During inference, they are converted into **hard Top-K selections**.
 
 ---
 
-##### 3.2.2.1 Phase 1: The Semantic Compressor (The Cornerstone)
+##### 3.2.2.1 Scoring Network
 
-**Role:** Semantic backbone of the memory system.  
-**Goal:** Use the LLM’s causal reasoning ability as a **regularizer**, forcing a Q-Former to compress a 4K-token block into a set of **reasoning-aware Detail Tokens** `D` (Tier-2 payload).  
-**Key design:** Prevent both:
-- semantic / logical information loss, and  
-- **“fingerprint” loss** (tiny but crucial differences: IDs, hashes, version tags)
+The Trimmer is implemented as a lightweight scorer network:
 
-during compression.
+\[
+\tilde{h}_t = \text{LayerNorm}(h_t \oplus h_\text{sum}) \\
+l_t = w^\top \sigma(W \tilde{h}_t + b) + c
+\]
 
-**Model structure**
+where:
 
-- **Writer:** Q-Former (BERT/ViT-style) + MLP  
-- **Output:** `N = 32` **Detail Tokens** `D` per block  
-  - Not just textual summaries  
-  - They are **carriers of logical and fingerprint-level information**
+- `⊕` is concatenation or a simple fusion (e.g., gated addition).  
+- `σ` is a non-linear activation (e.g., GELU / SiLU).  
+- `l_t` is a scalar logit per token.
+
+In matrix form, for block length `T`:
+
+- `L_trim = [l_1, ..., l_T] ∈ ℝ^T`.
 
 ---
 
-###### Two-Headed Objective
+##### 3.2.2.2 Hard Gumbel Top-K (Fixed Budget)
 
-Phase 1 combines **two complementary heads**:
+In the **first version**, the KV budget is **fixed by heuristic**, not learned:
 
-1. **Head A — Explanation SFT (Logic-Driven Head)**  
-2. **Head B — Reconstruction Head (Coverage & Fingerprints)**  
+- We set a rule-based `K = K(T)`:
+  - e.g., `K = K0 + α · log(T)` or a simple piecewise constant schedule.  
+  - Typical choice:
+    - Always keep:
+      - global anchors  
+      - local topic anchors
+    - plus a small quota of **learned important tokens** from the Trimmer.
+
+The selection mechanism:
+
+- **Training time:**
+  - Add Gumbel noise to `L_trim`:
+    \[
+    \hat{l}_t = l_t + g_t
+    \]
+  - Take **hard Top-K** according to `\hat{l}_t`:
+    \[
+    M^\text{hard}_t = 
+    \begin{cases}
+      1, & \text{if } t \text{ in Top-K}(\hat{l}) \\
+      0, & \text{otherwise}
+    \end{cases}
+    \]
+  - Use Straight-Through to define a soft version `M^soft` for backprop.
+
+- **Inference time:**
+  - No randomness:
+    - Directly pick Top-K tokens from `L_trim`.  
+  - Only those K tokens’ KV remain on GPU; others are candidates for eviction / tombstones.
+
+> Later work can relax this to **learning K** (via a sparsity penalty / budget regularizer).  
+> Phase 1 deliberately uses a **simple, rule-based K** to keep the system stable.
+
+---
+
+#### 3.2.3 Teacher–Student Training: Adversarial Compression Under a Fixed Budget
+
+The Trimmer is trained in a **teacher–student distillation** setup with a built-in **adversarial tension**:
+
+- The **Teacher (SFT LLM)** wants to use **as much context as possible** to reduce loss.  
+- The **Trimmer** is forced to operate under a **small K** (aggressive compression),  
+  and must learn to pick **only the most necessary tokens**.
+
+We do not explicitly optimize a game between two agents, but the training regime is **implicitly adversarial**:
+
+- Data is constructed to **punish lazy trimming** (dropping important tokens).  
+- The KV budget `K` is set small enough that the Trimmer *must* learn non-trivial selection.
+
+---
+
+##### 3.2.3.1 Training Setup
+
+For each training example:
+
+- There is a block `B` with tokens `[1..T]`.  
+- We choose a generation position inside `B` or shortly after it.  
+- We run:
+
+1. **Teacher run (full KV)**
+   - LLM runs on full context (no trimming).  
+   - Produces:
+     - logits `Y_teacher` for next token(s)  
+     - optional attention maps `A_teacher`.
+
+2. **Student run (trimmed KV)**
+   - Apply Trimmer’s hard mask `M^hard` (Top-K) to KV inside block `B`:
+     - `M_t = 0` → KV for token `t` is masked / dropped.  
+     - `M_t = 1` → KV retained.  
+   - LLM continues from same position with trimmed KV.  
+   - Produces:
+     - logits `Y_student`  
+     - attention `A_student` (optional)
+
+**Loss per mask:**
+
+\[
+\mathcal{L}_\text{trim} =
+\alpha \cdot \mathcal{L}_\text{CE}(Y_{student}, Y_{target})
++ \beta \cdot \mathcal{L}_\text{KL}(Y_{student} \parallel Y_{teacher})
++ \gamma \cdot \mathcal{L}_\text{Attn-KL}(A_{student} \parallel A_{teacher})
+\]
+
+- `CE` ensures the trimmed model still hits the correct tokens.  
+- `KL` ensures its **logit distribution** stays close to the full-context teacher.  
+- `Attn-KL` (optional) propagates a soft prior from teacher attention.
+
+Because `K` is small, any mask that discards essential tokens will incur **high CE/KL** → gradients force the Trimmer to raise scores on such tokens.
+
+---
+
+##### 3.2.3.2 Sample Construction: Trimming Scenarios (Especially Topic Switches)
+
+To make the Trimmer actually learn **semantically meaningful selection**, we need **stress-test scenarios** in training, especially around **topic changes**.
+
+We deliberately construct at least three families of trimming scenarios:
+
+1. **Intra-topic redundancy trimming (easy mode)**  
+   - Long stretches of filler text (e.g., verbose explanations, small talk),  
+   - Only a few tokens truly affect the next prediction (definitions, entities, key steps).  
+   - Goal:
+     - Trimmer learns to **drop redundant filler** while keeping structural anchors.
+
+2. **Cross-topic boundaries (topic switch) — “forget the right past”**  
+   - Training sequences are composed of:
+     - **Older topic A**
+     - then a clear switch to **topic B**, with its own internal definitions.
+   - The target tokens belong purely to topic B.
+   - Under full KV:
+     - Teacher may still attend into topic A occasionally (long-range attention tails).  
+   - Under trimming:
+     - Trimmer is encouraged to:
+       - Keep B’s **local anchors** and recent relevant tokens.  
+       - Aggressively drop most of A, except:
+         - global anchors  
+         - any **bridging tokens** reused in B (e.g., shared entity, reused variable).
+
+   - Data hint:
+     - We can tag timestamps / topic IDs in metadata, and construct situations where:
+       - A naive “keep all history” policy is wasteful,  
+       - The optimal strategy is to **mostly forget previous topics**, but **not entirely**.
+
+3. **Adversarial long-range dependence (hard mode)**  
+   - Sequences with multiple “chapters”:
+     - A1, A2, B1, B2, ...,  
+     - where the final question depends on **A1 + B2**, not the middle noise.  
+   - Construct answers / next tokens that:
+     - Are impossible without reading specific tokens in **older segments**.  
+   - Here:
+     - Teacher uses full KV and gets low loss.  
+     - Any Trimmer that drops those few key tokens gets **punished**.
+
+In all these scenarios:
+
+- The **Teacher** is free to use all tokens.  
+- The **Trimmer** is “attacked” by the data:  
+  - sequences are constructed so that **only very specific tokens** matter,  
+  - but the KV budget `K` is kept small,  
+  - so the Trimmer must learn to identify **semantic / structural pivot tokens** rather than just “recent ones”.
+
+This realizes the “adversarial” intuition:
+
+> - Trimmer is forced to **keep as few tokens as possible** (small K, hard Top-K).  
+> - The SFT / teacher setup **tries to expose as many useful dependencies as possible**, so dropping the wrong tokens is heavily penalized.
+
+---
+
+##### 3.2.3.3 Logical vs Physical Trimming
+
+- **During training:**  
+  - Trimming is **logical**:
+    - We mask / zero out certain KV entries inside GPU memory.  
+    - We do not move KV across PCIe.  
+  - This keeps the training loop simple and differentiable.
+
+- **During inference:**  
+  - Trimming becomes **physical**:
+    - Tokens selected by the Trimmer remain as live KV on GPU.  
+    - Remaining tokens:
+      - Either have their KV evicted to host,  
+      - Or are discarded, leaving behind **tombstones** for future block-level retrieval.
+
+This separation allows us to optimize purely for **information selection**, independently of systems details.
+
+---
+
+#### 3.2.4 Joint Adaptation with LoRA (Optional)
+
+Empirically, large LLMs can be **brittle** under aggressive KV trimming:
+
+- Some layers are highly sensitive to losing certain tokens.  
+- Naive trimming can cause quality collapse in long-tail cases.
+
+To mitigate this, we optionally:
+
+- Attach a small **LoRA** to the base LLM.  
+- Train **Trimmer and LoRA jointly**:
+
+  - Trimmer learns to propose good masks under the KV budget.  
+  - LoRA lets the LLM adapt to the new operating regime:
+    - “KV is no longer dense; it has been filtered.”  
+    - “Prefix KV may be injected from summaries / retrieved blocks.”
+
+**Training schedule**
+
+1. **Stage 1 – Frozen LLM, train only Trimmer**
+   - On top of a simple baseline (first-4 anchors + rolling window).  
+   - Get a stable Trimmer that works under a rule-based `K`.
+
+2. **Stage 2 – Unfreeze LoRA, joint training**
+   - LoRA helps recover performance lost due to trimming,  
+   - Especially on:
+     - very long contexts  
+     - topic-switch cases  
+     - adversarial long-range dependencies.
+
+---
+
+#### 3.2.5 Inference-Time Behavior (Within a Block)
+
+For each block, the token-level pipeline is:
+
+1. **Online generation**
+   - LLM generates tokens while the Memory OS monitors:
+     - `<SUMMARIZE>` predictions  
+     - anchor policies  
+   - KV accumulates until:
+     - `<SUMMARIZE>` fires, or  
+     - block length reaches `L_max`.
+
+2. **Block finalization & archival handshake**
+   - Once a block is closed:
+     - The Memory OS first takes a snapshot of the **full block hidden states / KV (pre-trim)** and hands this snapshot to the block-level writer (Q-Former, Section 3.3) for archival.
+     - Only after the snapshot is taken, the Trimmer scores all tokens in `[t_block_start, ..., t_block_end]`.  
+     - Top-K tokens (anchors + high-score tokens) are marked “to keep” as live KV on GPU.  
+     - Others:
+       - are evicted to host,  
+       - or dropped, leaving behind **tombstones** that mark where information was archived.
+
+3. **Hand-off to block-level memory (pre-trim snapshot)**
+   - Section 3.3 always operates on this **pre-trim snapshot** of the block.  
+   - Trimming only affects which KV stay **live** on GPU; it does **not** change what gets written into long-term block memory.
+
+In summary:
+
+- **3.2** defines a **write-side token-level game**:
+  - A learned summary trigger decides **where to cut**.  
+  - A Trimmer, under a fixed `K`, learns **which tokens deserve to survive**.  
+- Block-level compression and retrieval, built on top of these trimmed blocks, are the topic of **Section 3.3**.
+
+---
+
+### 3.3 Core Architecture: Interpretation-Driven Dual-Phase Encoding (Block-Level)
+
+After Section 3.2 has decided **when to cut a block** and **which tokens’ KV remain on GPU**, we move to the **block-level write path**:
+
+1. **First**, we train a **Q-Former-based writer** to compress each finalized 4K block into a set of **interpretation-friendly Detail Tokens** `D`, with:
+   - Explanation SFT (logic-preserving)
+   - Self-supervised reconstruction (detail-preserving)
+2. **Only after write-side semantics are fixed**, we train a **two-tower indexer** that:
+   - Maps `D` → block handler / index embedding `H`
+   - Maps LLM hidden state → query embedding `Q`
+   - Aligns `Q` and `H` via contrastive learning
+
+This ordering is intentional:
+
+> **All retrieval geometry lives on top of the Q-Former’s semantic bottleneck.  
+> The indexer never sees raw blocks, only the frozen, explanation-aware `D`.  
+> This structurally rules out a whole class of shortcuts.**
+
+---
+
+#### 3.3.1 Phase 1 (Write-Side): Semantic Compressor with Explanation & Reconstruction
+
+**Role:** Semantic backbone of the block-level memory writer.  
+**Goal:** Train a Q-Former to compress a 4K block into `N = 32` Detail Tokens `D` that:
+
+- Are rich enough to reconstruct the block (no “fingerprint loss”)  
+- Are structured enough to support “why retrieve / why not” style explanations  
+- Are fully independent of the later indexer geometry
+
+We use **two heads** and a carefully designed **data curriculum**.
+
+> Input blocks at this stage are **already segmented by 3.2** (summary trigger).
+> The Memory OS always takes a snapshot of the **full block hidden states / KV, before any Trimmer eviction**, and the Q-Former operates on this pre-trim snapshot.
+> During training we may still simulate logical trimming for the teacher–student setup, but the archival snapshot `B` is always defined as the **pre-trim block**.
+
+---
+
+##### 3.3.1.1 Data Construction: Positive / Negative Pairs & Shortcut Control
+
+Each training sample is a tuple:
+
+\[
+(\text{Block } B,\ \text{Query } q,\ \text{Label } y,\ \text{Metadata})
+\]
+
+where:
+
+- `B`: a 4K token block (dialogue window, document span, code chunk, etc.)  
+- `q`: a query that may or may not require information inside `B`  
+- `y`: label indicating:
+  - `y = 1`: **B is a supporting block** for `q`  
+  - `y = 0`: `B` is **not** sufficient / relevant for `q`  
+- `Metadata`: structured description (e.g., version, entity IDs, timestamps) used only for **data generation**, not exposed as input
+
+**Key constraint** (same精神 as 3.2, but now at block level):
+
+We actively design data so that the model **cannot** solve the task by:
+
+- Using only the query `q` and its prior knowledge  
+- Memorizing global patterns like “v2.0 questions almost always use later blocks”  
+- Ignoring `D` and still answering correctly
+
+Concretely:
+
+1. **Inject block-local facts that are not in the base LLM**
+   - Synthetic IDs, random hashes, opaque codes  
+   - Local redefinitions: e.g., rebind `var_x` within `B`  
+   - Custom “v1.0 vs v2.0” semantics that contradict public knowledge / defaults
+
+2. **Construct hard positives**
+   - `y = 1` samples where:
+     - Without `B`, the query is **unanswerable**  
+     - With `B`, it becomes answerable via a small number of reasoning steps  
+   - This forces the model to use `D` as the **only reliable source** for certain key facts.
+
+3. **Construct hard negatives (two types)**
+   - **Type N1 – Semantic-but-wrong:**
+     - Block `B_neg` has **similar topic / entities** as the true block,  
+       but is logically incompatible:
+       - Different version  
+       - Different parameter  
+       - Same function name but different behavior  
+     - For these, the correct rationale is:
+       > “I do **not** retrieve this because …”
+   - **Type N2 – Distractor overlaps:**
+     - Blocks that share some superficial patterns (names, keywords)  
+       but are entirely irrelevant to the specific query.
+
+By construction, any model that **ignores `D`** and relies on `q` priors will:
+
+- Do well on easy cases, but  
+- Be systematically wrong on these **adversarially shaped negatives**.
+
+This creates a strong incentive to encode **block-local, non-global** information into `D`.
+
+---
+
+##### 3.3.1.2 Head A: Explanation SFT (Logic-Driven Head)
+
+Given `(B, q, y)`:
+
+1. Encode the block with Q-Former to get `D`:
+
+   \[
+   D = \text{QFormer}(B)
+   \]
+
+2. Feed the frozen LLM with:
+   - The query `q`  
+   - A special memory segment containing `D`, bracketed by:
+     - `<MEM_START>` … `<MEM_END>`
+
+3. Train the LLM (with a small trainable head or LoRA) to generate a **Retrieval Rationale**:
+
+   - If `y = 1` (positive block):
+
+     > “I retrieve this because it defines `var_x` used in question (2).  
+     > It also introduces the v2.0 behavior that the query is asking about.”
+
+   - If `y = 0` (negative block):
+
+     > “I do **not** retrieve this because this block describes v1.0  
+     > while the question asks specifically about v2.0 semantics.”
+
+The loss `\(\mathcal{L}_\text{rationale}\)` can be:
+
+- Pure sequence-level CE over rationale tokens, or  
+- A mix of:
+  - CE (for fluency)  
+  - Classification head (retrieve / not retrieve)  
+  - Span-level supervision (pointing to specific facts in `B`)
+
+**Why this avoids shortcuts:**
+
+- Hard negatives are constructed so that:
+  - Top-level topic and entities can be similar, but  
+  - Correctness hinges on **fine details in `B`**.  
+- Any rationale that does **not** read those details from `D` will be inconsistent with label `y`.
+
+---
+
+##### 3.3.1.3 Head B: Self-Supervised Reconstruction (Coverage & Fingerprints)
+
+Explanation alone is not enough.  
+We also need `D` to carry **raw, non-verbalizable fingerprints**:
+
+- hashes  
+- opaque identifiers  
+- arbitrary numeric patterns  
+- local structural quirks
+
+We add a **self-supervised reconstruction head**:
+
+1. The model sees:
+   - (Optionally) the query `q`  
+   - Detail Tokens `D` as a prefix memory segment
+
+2. It is trained to reconstruct a target derived from `B`, e.g.:
+
+   - Full token sequence of `B` (causal LM loss), or  
+   - A compressed representation:
+     - Important spans  
+     - Extracted key-value pairs  
+     - Chunked tokens with span corruption / denoising
+
+3. Loss `\(\mathcal{L}_\text{recon}\)`:
+
+   - Token-level CE (standard LM loss)  
+   - Optionally combined with a span-level objective (e.g., denoising autoencoder)
+
+**Effect:**
+
+- `\(\mathcal{L}_\text{recon}\)` is:
+  - Self-supervised (no extra labels)  
+  - A cheap “insurance policy” ensuring that `D` is **information-complete**  
+- To minimize `\(\mathcal{L}_\text{recon}\)`, the Q-Former must encode:
+  - IDs  
+  - Rare tokens  
+  - Local structure  
+  that may **never** be mentioned in natural-language rationales.
+
+---
+
+##### 3.3.1.4 Phase 1 Objective & Freezing
+
+The Phase 1 loss:
 
 \[
 \mathcal{L}_\text{Phase1} = \mathcal{L}_\text{rationale} + \lambda_\text{recon} \cdot \mathcal{L}_\text{recon}
 \]
 
-Where:
+After convergence:
 
-- `L_rationale` teaches **why** a block is relevant or not.  
-- `L_recon` ensures `D` retains **all information needed** to reconstruct the original block, including non-verbalizable details.
+- Q-Former is **frozen**.  
+- `D` is now:
+  - Explanation-aware (via SFT)  
+  - Detail-complete (via reconstruction)  
+  - Independent of any particular retrieval index geometry
 
----
-
-###### Head A: Explanation SFT (Logic-Driven Head)
-
-For each `(Block, Query)` pair:
-
-1. Encode the block with the Q-Former to obtain Detail Tokens `D`.  
-2. Inject `D` as a **soft prompt** into a **frozen LLM**.  
-3. Ask the LLM to generate a **Retrieval Rationale**:
-
-   - **Type A (Positive):**  
-     > “I retrieve this because it defines `var_x` needed by the query.”  
-     → Forces `D` to encode semantic associations and supporting facts.
-
-   - **Type B (Negative — Anti-Shortcut):**  
-     > “I do **not** retrieve this because the query asks for v2.0 features,  
-     > but this block describes v1.0.”  
-     → Forces `D` to encode fine-grained **exclusion signals** (wrong version, wrong ID, wrong condition).
-
-**Curriculum (crucial)**
-
-- At least **50% hard negatives**:
-  - Blocks that are **semantically similar** but **logically incompatible** with the query.  
-- To generate good *rejection* rationales, `D` must preserve **sharp distinctions** (e.g., v1.0 vs v2.0), not just fuzzy topic vectors.
+These Detail Tokens `D` become the canonical **Tier-2 payload** stored in **L2 Semantic Payload** (see Section 2.3).
 
 ---
 
-###### Head B: Reconstruction Head (Coverage & Fingerprints)
+#### 3.3.2 Phase 2 (Write-Side → Index): Block Handler via Two-Tower Distillation
 
-Explanation alone is **not enough**:
+**Role:** Learn a **retrieval-friendly geometry** on top of the frozen semantic space `D`.  
+**Goal:** Convert each block’s `D` into a single **index embedding** `H`, and align it with LLM query embeddings `Q`.
 
-- Some differences are hard to verbalize:
-  - Hash-like IDs  
-  - Opaque keys / codes  
-  - Arbitrary numeric patterns  
+Important constraints:
 
-If we rely only on Explanation SFT, the Q-Former may **“get away with” discarding** these details, as they rarely appear in natural-language rationales.
+- The **writer tower** sees only `D` (Phase 1 output).  
+  - It does **not** see raw block text or KV.  
+  - This structurally blocks a large class of shortcuts.
 
-To prevent this, we add a **self-supervised reconstruction task**:
-
-- **Setup:**
-  - Use the original block text (or its token sequence) as target.  
-  - Feed the LLM with:
-    - (Optionally) the Query  
-    - The Detail Tokens `D` as a **soft prefix**.  
-  - Train a small **decoder head / LM head** (or reuse the frozen LLM head) to reconstruct the original block.
-
-- **Loss:**
-  - Reconstruction loss `L_recon`:
-    - Causal LM loss over the original block tokens  
-    - Or hybrid (token CE + span-level contrastive)
-
-- **Intuition:**
-  - `L_recon` is:
-    - **Self-supervised** (no human labels)  
-    - A zero-cost **“insurance policy”** against fingerprint loss.  
-  - To minimize `L_recon`, `D` must contain **all information necessary** to reconstruct the original block, including:
-    - IDs  
-    - Rare tokens  
-    - Local structures that may never appear in rationales.
+- The **reader tower** lives on the LLM side (read-side), but it learns purely from:
+  - LLM hidden states as input,  
+  - Block-level supervision (which block should be retrieved),  
+  - **No direct access** to block contents.
 
 ---
 
-###### Control Tokens
+##### 3.3.2.1 Writer Tower: `D → H` (Block Handler)
 
-We jointly train special control tokens:
+- **Input:** frozen `D` for a block `B`  
+- **Architecture:**
+  - Tiny Transformer (2–4 layers) over the sequence of Detail Tokens  
+  - Random token dropout (e.g., mask 30–50% of `D` during training) to:
+    - Prevent over-reliance on a single “golden” token  
+    - Encourage **global use** of the semantic space
 
-- `<MEM_START>`  
-- `<MEM_END>`
+- **Output:**
 
-so that the LLM learns **semantic isolation** of the memory segment injected via `D`:
+  \[
+  H = g(D) \in \mathbb{R}^d
+  \]
 
-- Inside `<MEM_START> ... <MEM_END>`:
-  - The model focuses on using `D` for rationale + reconstruction.
-- Outside:
-  - Normal LLM behavior is preserved.
+  a single **index embedding** per block.
 
----
-
-###### Phase 1 Result
-
-After Phase 1:
-
-- The Q-Former is **frozen**.  
-- Detail Tokens `D` form a **high-fidelity, causally-informed, reconstruction-capable representation** of each block.  
-- `D` are stored in **L2 Semantic Payload (host RAM)** as the **default recall unit**.
+`H` is what we store in **L1 Hot Index** (e.g., HNSW / DNII).
 
 ---
 
-##### 3.2.2.2 Phase 2: The Index Distiller (Alignment & Indexing)
+##### 3.3.2.2 Reader Tower: `h_seed → Q` (LLM Query Head)
 
-**Role:** Retrieval adapter of the system.  
-**Goal:** On top of frozen `D`, train a **lightweight distiller** to resolve the tension between:
+- **Input:** a **seed hidden state** `h_\text{seed}` from the LLM:
 
-- **Semantic completeness** (kept in `D`) and  
-- **Retrieval geometry** (embedding space for ANN)
+  - At a `<RETRIEVE>` token, or  
+  - Constructed by fusing:
+    - current position hidden  
+    - relevant tombstone hidden states  
+    - local context summary
 
-and produce **Tier-1 index vectors** `H`.
+- **Architecture:**
+  - MLP / Mixer / small gated network
 
-**Asymmetric two-tower structure**
+- **Output:**
 
-- **Writer tower (Index Distiller):**
-  - **Input:** frozen Detail Tokens `D` from Phase 1  
-  - **Architecture:** Tiny Transformer (2–4 layers)  
-  - **Trick — Random Token Dropout (input masking):**
-    - During training, randomly mask out **30–50%** of tokens in `D`.  
-    - Forces the distiller to use **global information**, not overfit to a single “golden token”.  
-  - **Output:** single **Index Embedding** `H` per block.
+  \[
+  Q = f(h_\text{seed}) \in \mathbb{R}^d
+  \]
 
-- **Reader tower (Query Projector):**
-  - **Input:** main LLM hidden state (e.g., at a `<RETRIEVE>` token or retrieval step)  
-  - **Architecture:** MLP / Mixer  
-  - **Output:** single **Query Embedding** `Q`.
-
-**Training – Contrastive alignment**
-
-- **Task:** map the **interpretive space** (`D`) to a **metric retrieval space** (`H`, `Q`) suitable for ANN / DNII.
-- **Loss:**
-  - **InfoNCE** (listwise contrastive loss).  
-  - **No BCE loss** – we want a **well-shaped embedding topology**, not just a “yes/no” classifier.
-
-- **Hard negative mining:**
-  - In each batch, mix in blocks that:
-    - Are **semantically close** (same topic / entity)  
-    - But **logically incompatible** with the query (different version, wrong ID, wrong condition)
-  - Hard negatives are constructed using Phase 1 signals (rationales, tags).  
-  - Forces the distiller to preserve the **sharp features** encoded in `D`.
-
-**Phase 2 Result**
-
-- `H` lives in a retrieval-friendly space (HNSW / DNII).  
-- `D` remains a rich, interpretable representation in host RAM.  
-- At runtime, retrieval is:
-  - `Q → ANN over H → block IDs → load D for those blocks`.
+`Q` lives in the **same embedding space** as `H`.
 
 ---
 
-#### 3.2.3 Read-Side: Retrieval Projection & Runtime Workflow
+##### 3.3.2.3 Contrastive Training: Aligning `Q` and `H`
 
-At inference time, the system reuses both phases to decouple:
+For each training instance, we know:
 
-- **Fast retrieval** (ANN over compact index embeddings `H`)  
-- **Deep understanding** (LLM reasoning over Detail Tokens `D`)
+- The **supporting blocks** `B_\text{pos}` whose Detail Tokens `D_\text{pos}` contain the answer  
+- A pool of negatives `B_\text{neg}`:
+  - Random negatives  
+  - Hard negatives:
+    - same topic, wrong version  
+    - same entity, wrong time  
+    - same function name, different behavior
 
-The **default recall path** is **Detail-Token-based soft prompting**.  
-Raw KV injection is treated as an **optional, advanced expansion mode**.
+We compute:
 
----
+\[
+H_\text{pos} = g(D_\text{pos}), \quad
+H_\text{neg} = g(D_\text{neg}), \quad
+Q = f(h_\text{seed})
+\]
 
-##### Write path (Indexing)
+Then use an **InfoNCE loss**:
 
-For each completed block:
+\[
+\mathcal{L}_\text{index} = - \log \frac{\exp(\text{sim}(Q, H_\text{pos}) / \tau)}
+{\exp(\text{sim}(Q, H_\text{pos}) / \tau) + \sum_{H \in \mathcal{N}} \exp(\text{sim}(Q, H) / \tau)}
+\]
 
-1. **Semantic payload (L2):**  
-   `Block  ->(Frozen Q-Former)->  Detail Tokens D  ->(Save)->  L2 Semantic Payload (Host RAM)`
+where:
 
-2. **Index embeddings (L1):**  
-   `Detail Tokens D  ->(Tiny Transformer Distiller)->  Index Embedding H  ->(Save)->  L1 Hot Index (HNSW / DNII)`
+- `sim` is cosine similarity or dot product  
+- `𝒩` contains in-batch negatives + mined hard negatives
 
-3. **Optional raw KV archive (L3):**  
-   `Block KV  ->(De-rotate + FP8)->  Raw KV Archive  ->(Save)->  L3 (Host RAM / SSD)`  
-   - Used only for **rare, verbatim, or full-context reconstruction** cases.
+This teaches:
 
-- Phase 1 guarantees the **quality & faithfulness** of `D`.  
-- Phase 2 guarantees the **retrieval geometry** of `H`.  
-- L3, if enabled, guarantees an **ultimate fallback** for lossless recovery.
+- `Q` to land near the **correct block handlers**  
+- `H` to be **discriminative** among semantically similar but logically different blocks
 
----
+After Phase 2:
 
-##### Read path (Retrieval)
-
-1. **Query embedding:**
-   - From the current LLM context (e.g., at a `<RETRIEVE>` token or a scheduled retrieval step):
-
-     `LLM Context  ->(Query Projector)->  Query embedding Q`
-
-2. **Index search (L1):**
-   - Use `Q` to query the Hot Index:
-
-     `Q  vs  HNSW / DNII over {H}  →  Top-K block IDs`
-
-3. **Default injection (L2 – Detail Tokens):**
-   - Load the corresponding Detail Tokens `D` from L2 (host RAM).  
-   - Inject `D` into the current context as a **soft prompt / memory segment**, bracketed by:
-     - `<MEM_START>`  
-     - `<MEM_END>`  
-   - This is the **default, interpretation-driven recall mechanism**.
-
-4. **Generation:**
-   - The LLM continues generation, conditioned on:
-     - Current local KV (recent context)  
-     - Injected Detail Tokens `D` (long-term memory)
+- `D` (Phase 1) remains frozen, stored in **L2**  
+- `H` (Phase 2) forms the **L1 index** for fast ANN / DNII retrieval  
+- The reader tower `f` becomes the **retrieval head** for the LLM.
 
 ---
 
-##### Optional: Raw KV expansion (L3 – Fallback Mode)
+#### 3.3.3 Read-Side (Runtime): Using `H` and `D` at Inference
 
-In rare cases, the system (or user) may require **verbatim or full-structure reconstruction**:
+With write-side semantics fixed, runtime retrieval decomposes into:
 
-- Triggered by:
-  - A special control token, e.g., `<EXPAND_RAW>`  
-  - Or an explicit user request: “quote the original paragraph exactly”
+1. **When to retrieve?** – decided by the Memory OS and `<RETRIEVE>` / tombstone mechanisms (see Section 3.2 & policy section).  
+2. **How to build `Q`?** – apply the reader tower `f` to the chosen `h_\text{seed}`.  
+3. **How to reuse blocks?** – use `H` for fast lookup, `D` for semantic injection.
 
-- Behavior:
-  1. For selected Top-K blocks, load their **de-rotated FP8 raw KV** from L3.  
-  2. Re-rotate via RoPE to the appropriate position IDs.  
-  3. Splice the recovered KV into the GPU KV cache.
+At a high level:
 
-- Trade-off:
-  - Much higher GPU memory & bandwidth cost.  
-  - Only used selectively, not in the default infinite-context workflow.
+1. **Trigger**  
+   - Model emits `<RETRIEVE>`, or  
+   - Tombstone attention / periodic policy decides to retrieve.
 
----
+2. **Query projection**  
+   - Construct `h_\text{seed}` from current / tombstone / local summary hidden states.  
+   - Compute:
+     \[
+     Q = f(h_\text{seed})
+     \]
 
-### 3.3 Phase 3: Algorithm II — Cognitive Memory Graph
+3. **Index search (L1)**  
+   - Use `Q` to query the L1 Hot Index over `{H}` (HNSW / DNII).  
+   - Obtain Top-K block IDs.
 
-**Goal:** Build a dynamic graph over memory blocks using **Virtual Nodes**, to support macro-level navigation.
+4. **Load semantic payload (L2)**  
+   - For each retrieved block:
+     - Load its frozen Detail Tokens `D` from L2 Semantic Payload (host RAM).
 
-#### 3.3.1 System Diagram (Conceptual)
+5. **Inject `D` as soft prompt**  
+   - Insert retrieved `D` into the context, bracketed by `<MEM_START>` / `<MEM_END>`.  
+   - For a short horizon `T_\text{protect}`, protect these tokens from trimming so the model can fully use them.
 
-(Original mermaid-style diagram omitted here; see repo for full graph illustration.)
-
-Core ideas:
-
-- **Memory Graph**
-  - Virtual Nodes (topics)  
-  - Real Nodes (memory blocks)  
-  - Temporal & hierarchical edges  
-
-- **Macro-Write (“The Gardener”)**
-  - Online clustering of blocks into Virtual Nodes  
-  - Self-organizing, unsupervised topology
-
-- **Macro-Read (“The Walker”)**
-  - RL agent navigating the graph:
-    - Macro jumps between Virtual Nodes  
-    - Micro steps within a node’s blocks
+6. **Optional raw KV expansion (L3)**  
+   - In rare, explicit cases (verbatim quoting, oracle-style analysis),  
+     - Load raw, de-rotated KV from L3 Archive,  
+     - Re-rotate with RoPE,  
+     - Splice into the GPU KV cache.
 
 ---
 
-#### 3.3.2 Macro-Write: The Gardener (Self-Organizing)
+**Summary for 3.3**
 
-**Core idea:** Graph construction is **objective, unsupervised**. It reflects the **density and distribution** of memories in semantic space.
+- **Phase 1 (Q-Former):**  
+  - Learns an **interpretation-friendly, detail-complete** semantic representation `D` for each block, using:
+    - Explanation SFT (logic)  
+    - Self-supervised reconstruction (coverage / fingerprints)  
 
-- **Role:** Online clustering algorithm (non-neural agent).  
-- **Mechanism:**
-  - **Assign:** When a new block summary `S_new` appears, compute its distance to existing Virtual Nodes (centroids).  
-  - **Update:** Move the nearest centroid toward `S_new` (e.g., EMA). This simulates topic drift over time.  
-  - **Spawn:** If `S_new` is far from all existing centroids (distance > threshold), create a new Virtual Node.  
-  - **Split:** If a Virtual Node has high variance among its attached blocks, split it into two new Virtual Nodes.
+- **Phase 2 (Two-Tower Indexer):**  
+  - Learns a **retrieval geometry** (`H`, `Q`) *on top of `D`*, without touching raw blocks.  
 
----
-
-#### 3.3.3 Macro-Read: The Walker (RL-Based Navigator)
-
-**Core idea:** Graph *usage* is subjective. The Walker navigates the Gardener-maintained “highway network”.
-
-- **Role:** RL agent (policy network).  
-- **Action space:**
-  - **Macro-Jump:** Move to a neighboring Virtual Node (topic switch).  
-  - **Micro-Step:** Within the current Virtual Node, select specific blocks (detail lookup).
-
-- **Training:**
-  - Only train the Walker.  
-  - Environment (graph construction) is fixed → relatively stable RL environment → fast convergence.
+- **Runtime:**  
+  - Memory OS decides **when** to retrieve (`<RETRIEVE>` + tombstones).  
+  - Reader tower maps LLM hidden state to `Q`.  
+  - Index returns block handlers `H`; we fetch `D` and inject them as the **default recall payload**, with raw KV as an optional fallback.
 
 ---
 
