@@ -125,109 +125,122 @@ Uses a **hot–cold separation** strategy to balance speed and capacity.
 
 ---
 
-### 3.2 Phase 2: Algorithm I — Semantic Indexing Core
+### 3.2 Core Architecture: Interpretation-Driven Dual-Phase Encoding
 
-**Goal:** Train the **Q-Former** and **Projector** so the system can **understand history** and **retrieve memory accurately**.
-
----
-
-#### 3.2.1 Segmentation & Trimming Policy
-
-**Strategy A: Context Trimmer with Stochastic Exploration**  
-(based on Gumbel exploration)
-
-Introduce a **Straight-Through Gumbel-Softmax (STE)** mechanism, and optimize the trimmer by minimizing the generation error introduced by trimming.
-
-- **Trimmer model:**  
-  A lightweight scorer:  
-  `LayerNorm -> Linear -> Linear`  
-  Outputs raw logits \( L_{\text{trim}} \).
-
-##### Training (Soft-to-Hard Distillation)
-
-1. **Sampling:**  
-   - Add Gumbel noise to \( L_{\text{trim}} \).  
-   - Perform multi-sample Top-K sampling to obtain **N different hard masks** \( M_{\text{hard}} \).
-
-2. **Parallel Forward (Simulation):**  
-   - Use the **N** variants of \( M_{\text{hard}} \) to simulate trimmed KV caches  
-     (i.e., apply masking / zero-filling to the original KV).  
-   - During training, **no physical eviction** is performed.
-
-3. **Loss Function (End-to-End):**
-
-   - **Teacher output:** \( Y_{\text{teacher}} \) (logits from full context)  
-   - **Student output:** \( Y_{\text{student}} \) (logits from trimmed context using \( M_{\text{hard}} \))
-
-   \[
-   \mathcal{L}_{\text{trim}} = 
-   \alpha \cdot \mathcal{L}_{\text{CE}}(Y_{\text{student}}, Y_{\text{target}})
-   + \beta \cdot \mathcal{L}_{\text{Logit-KL}}(Y_{\text{student}} \parallel Y_{\text{teacher}})
-   + \gamma \cdot \mathcal{L}_{\text{Attn-KL}}(\text{Trimmer Logits} \parallel \text{Teacher Attn})
-   \]
-
-   - **Mechanism:**  
-     - Gumbel noise provides exploration.  
-     - The loss penalizes the deviation in logits caused by trimming.
-
-##### Inference (Physical Trim)
-
-- Only at **inference time**, the trimmer outputs logits and we:
-  - Apply **Top-K** selection.  
-  - **Physically zero out and evict** KV entries that are not selected, migrating them to host RAM.
+This system adopts an aggressive **“interpret first, distill later”** dual-phase architecture.  
+We do **not** train retrieval vectors directly. Instead, we first train a *reasoning-aware compressor*, then distill its outputs into compact retrieval indices.
 
 ---
 
-#### 3.2.2 Write-Side: Compression & Alignment
+#### 3.2.1 Phase 1: The Semantic Compressor (The Cornerstone)
 
-This pipeline uses an **integrated training** strategy, operating directly in the **text domain** to avoid maintaining a massive KV dataset.
+**Role:** The semantic backbone of the system.  
+**Goal:** Use the LLM’s causal reasoning ability as a **regularizer**, forcing a Q-Former to compress a 4K-token block into a set of **reasoning-aware Detail Tokens** (Tier-2 payload).  
+**Key design:** Prevent information loss and shortcut learning during compression.
 
-##### On-the-fly Context Perturbation
+**Model structure**
 
-- **Input:** Raw text corpus.  
-- **Process:** During the training loop, apply masking or trimming strategies to the text in real time (simulating inference-time forgetting).  
-- **Forward:** Feed the processed text into a **frozen LLM**.  
-- **Output:** On-the-fly hidden states with **contextual noise**.
+- **Writer:** Q-Former (BERT/ViT-style) + MLP  
+- **Output:** `N = 32` **Detail Tokens** (`D`)  
+  - These tokens are **not** just textual summaries.  
+  - They are **carriers of logical information**.
 
-**Advantage:** Completely avoids the version alignment and storage overhead of offline KV dumps.
+**Training strategy: Explanation SFT**
 
-##### Latent Generation (Compression)
-
-- **Input:** Block-level hidden states generated on the fly.  
-- **Module:** Trainable **Q-Former**.  
-- **Operation:** Cross-attention.  
-- **Output:** **Summary embeddings**.
-
-##### Semantic Reconstruction (Alignment)
-
-- **Goal:** Force the summary embeddings to retain sufficient semantic information.
 - **Task:**  
-  - Use the summary embeddings as a **soft prompt prefix**.  
-  - Ask the LLM to reconstruct the original block text (Causal LM Loss).
+  Given a `(Block, Query)` pair:
+  - Encode the block with the Q-Former to obtain Detail Tokens `D`.
+  - Inject `D` as a **soft prompt** into a **frozen LLM**.
+  - Ask the LLM to generate a **Retrieval Rationale** (why this block should or should not be retrieved).
+
+- **Data curriculum (crucial):**  
+  At least **50% hard negatives**, so the Q-Former is forced to encode *discriminative* features.
+
+  - **Type A (Positive):**  
+    > “I retrieve this because it defines `var_x` needed by the query.”  
+    → Forces encoding of semantic associations.
+
+  - **Type B (Negative — The Anti-Shortcut):**  
+    > “I do **not** retrieve this because the query asks for v2.0 features,  
+    > but this block describes v1.0.”  
+
+- **Intuition:**  
+  For the LLM to generate a *rejection* rationale, the Detail Tokens `D` must clearly preserve the **v1.0 vs v2.0** distinction, not just a fuzzy “version-ish” hint.  
+  This is a **physical mechanism** to prevent feature collapse and shortcut solutions.
+
+- **Control tokens:**  
+  Jointly train special tokens:
+  - `<MEM_START>`
+  - `<MEM_END>`  
+  so that the model learns **semantic isolation** of the memory segment.
+
+- **Result:**  
+  After Phase 1 training:
+  - The Q-Former is **frozen**.  
+  - The resulting Detail Tokens `D` form a **high-fidelity, causally-informed semantic intermediate representation**.
 
 ---
 
-#### 3.2.3 Read-Side: Retrieval Projection
+#### 3.2.2 Phase 2: The Index Distiller (Alignment & Indexing)
 
-Executed when the model needs to **retrieve** memory.
+**Role:** The retrieval adapter of the system.  
+**Goal:** On top of the **frozen** Phase-1 outputs, train a lightweight distiller that resolves the tension between **semantic completeness** and **retrieval geometry**, producing the Tier-1 index vectors.
 
-##### 1. Retrieval Policy: Tombstone Activation
+**Model structure: Asymmetric two-tower**
 
-- **Mechanism:** During inference, monitor the attention weights to **tombstone tokens** in the context.  
-- **Trigger:**  
-  - If attention > threshold, the model is likely needing the compressed information behind that tombstone.  
-- **Action:**  
-  - Trigger `<RETRIEVE>` and use this tombstone as a **key** to retrieve the original block.
+- **Writer tower (The Distiller):**
+  - **Input:** Frozen Detail Tokens `D` from Phase 1
+  - **Architecture:** Tiny Transformer (2–4 layers)
+  - **Trick – Random Token Dropout (input masking):**
+    - During training, randomly mask out **30–50%** of the input tokens.
+    - **Intuition:** Forces the Tiny Transformer to scan **global** information instead of overfitting to a single “golden” token.
+  - **Output:** A single **Index Embedding** `H`.
 
-##### 2. Retrieval Matching: Learning What to Ask
+- **Reader tower (Query Projector):**
+  - **Input:** Hidden state of the main LLM (e.g., at the retrieval step)
+  - **Architecture:** MLP / Mixer
+  - **Output:** A single **Query Embedding** `Q`.
 
-- **Module:** **Gated MLP (SwiGLU) Projector**.  
-- **Input:**  
-  - Final-layer hidden state \( h_{\text{ret}} \) when the LLM generates the `<RETRIEVE>` token.  
-- **Output:**  
-  - Predicted **summary embedding**.  
+**Training strategy: Contrastive alignment**
+
+- **Task:**  
+  Map the **explanatory semantic space** (Detail Tokens `D`) into a **metric retrieval space**.
+
 - **Loss:**  
-  - **InfoNCE (contrastive loss)**.
+  - **InfoNCE** (listwise contrastive loss).  
+  - **No BCE loss**: we explicitly avoid binary classification; we want a **well-structured embedding topology**, not just “relevant / non-relevant” logits.
+
+- **Hard negative mining:**  
+  - In each batch, mix in blocks that are:
+    - **Semantically very similar**  
+    - But **logically contradictory** (e.g., different IDs, different versions).  
+  - These are mined using Phase-1 signals.  
+  - This forces the Distiller to pick up the **sharp features** preserved in Phase 1 (IDs, version numbers, etc.), not just topic-level similarity.
+
+---
+
+#### 3.2.3 Inference Workflow (Runtime)
+
+At inference time, the system reuses the products of both phases to decouple **fast retrieval** from **deep understanding**.
+
+**Write path (indexing)**
+
+1. `Block ->(Frozen Q-Former)-> Detail Tokens (D) ->(Save)-> Host RAM (Tier 2)`
+2. `Detail Tokens (D) ->(Tiny Transformer)-> Index Embedding (H) ->(Save)-> HNSW Index (Tier 1)`
+
+- Phase 1 guarantees the **quality and faithfulness** of `D`.  
+- Phase 2 guarantees the **retrieval directionality** of `H`.
+
+**Read path (retrieval)**
+
+1. `LLM Context ->(Projector)-> Query (Q)`
+2. **Search:**  
+   `Q` vs HNSW over `H` → Top-K hits
+3. **Inject:**  
+   Load the corresponding Detail Tokens `D` from Host RAM and inject them as a **soft prompt** into the current LLM context.
+4. **Generate:**  
+   The LLM generates the final answer, conditioned on these **reasoning-aware Detail Tokens**.
+
 
 ---
 
