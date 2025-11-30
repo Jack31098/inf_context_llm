@@ -73,53 +73,144 @@ This is **token-level, learned KV eviction**, not just sliding windows.
 
 ---
 
-### 2. Block-level semantic memory via Q-Former
+### 2. Interpretation-driven dual-phase encoding for block memory
 
 Instead of:
 
-- Only storing KV
-- Or only storing text summaries
+- Only storing raw KV
+- Or only storing bag-of-words text summaries
+- Or training retrieval vectors directly
 
-We:
+We adopt an aggressive **“interpret first, distill later”** dual-phase architecture:
 
-- Cut the past into **Memory Blocks**  
-- For each block, use a **Q-Former** to produce a **small set of summary embeddings** (information bottleneck)
-- These embeddings are **not** used as online prefix-KV; they are:
-  - **Block tags / handlers** for later retrieval
-  - A semantic “name” for a huge KV block stored on host
+1. **Phase 1 – Semantic Compressor (The Cornerstone)**  
+   Train a Q-Former to produce **reasoning-aware Detail Tokens** `D` for each 4K block, using the LLM’s own **causal reasoning** as a regularizer.
 
-All layers’ KV for that block can be stored off-GPU and later fetched **as a unit** via that tag.
+2. **Phase 2 – Index Distiller (Alignment & Indexing)**  
+   On top of frozen Detail Tokens, train a lightweight distiller + query projector to map into a **metric retrieval space** suitable for ANN / HNSW, without destroying the semantics learned in Phase 1.
+
+This way we get:
+
+- A **Tier-2 payload** (`D`): high-fidelity, interpretable, “knows why this block matters”.
+- A **Tier-1 index** (`H`): compact, ANN-friendly embeddings for fast retrieval.
+
+See below for details.
 
 ---
 
-### 3. Differentiable Neural Inverted Index (DNII) for blocks
+### 2.1 Phase 1: Semantic Compressor (Detail Tokens)
 
-Instead of:
+**Role:** Semantic backbone of the memory system.  
+**Goal:** Use the frozen LLM’s reasoning ability as a **regularizer**, to force a Q-Former to compress a 4K-token block into a set of **reasoning-aware Detail Tokens** `D` (Tier-2 payload).  
+**Key design:** Prevent information loss and shortcut learning during compression.
 
-- Pure HNSW / FAISS search over block embeddings (fast but non-differentiable)
-- Or a giant static graph RAG that’s expensive to maintain
+**Model structure**
 
-We design a **DNII**:
+- **Writer:** Q-Former (BERT/ViT-style) + MLP  
+- **Output:** `N = 32` **Detail Tokens** (`D`) per block  
+  - Not just textual summaries  
+  - They are **carriers of logical information** (what version? which entity? which condition?)
 
-- Many **Index Heads**, each with:
-  - A learnable **centroid matrix** `C` (virtual nodes / topics)
-  - **Posting lists** `L[i]` storing block IDs attached to centroid `i`
-- **Write path** (online clustering):
-  - For a new block summary `s_new`:
-    - Find nearest centroid(s)
-    - Append block ID to corresponding list(s)
-    - Update centroid via EMA
-- **Read path** (two-hop, soft-to-hard):
-  - Hop 1: Query `q` → Softmax / STE over centroids → select Top-M virtual nodes
-  - Hop 2: Scan only their posting lists, re-score candidate blocks → Top-K blocks
+**Training strategy – Explanation SFT**
 
-Crucially:
+For each `(Block, Query)` pair:
 
-- The **query projector** is trained with **InfoNCE**  
-- The routing is **soft / STE**, so retrieval is **end-to-end trainable** w.r.t. the LLM’s retrieval token hidden state
+1. Encode the block with the Q-Former to obtain Detail Tokens `D`.
+2. Inject `D` as a **soft prompt** into the frozen LLM.
+3. Ask the LLM to generate a **Retrieval Rationale**:
 
-This sits in between “vector DB” and “DSI-style neural index”:  
-fast, dynamic, and **purpose-built for LLM memory blocks**.
+   - **Type A (Positive):**  
+     > “I retrieve this because it defines `var_x` needed by the query.”  
+     Forces `D` to encode semantic associations.
+
+   - **Type B (Negative – Anti-Shortcut):**  
+     > “I do **not** retrieve this because the query asks for v2.0 features,  
+     > but this block describes v1.0.”  
+
+**Curriculum (crucial):**
+
+- At least **50% hard negatives**:
+  - Blocks that are *semantically similar* but *logically incompatible* with the query
+- To generate good rejection rationales, `D` must preserve **sharp details** (e.g., IDs, versions), not just fuzzy “topic vectors”.
+
+**Control tokens**
+
+- Jointly train special tokens:
+  - `<MEM_START>`
+  - `<MEM_END>`
+- So the LLM learns **semantic isolation** of the memory segment injected via `D`.
+
+**Result**
+
+- After Phase 1, the Q-Former is **frozen**.  
+- Detail Tokens `D` form a **high-fidelity, causally-informed intermediate representation** of each memory block.
+- `D` are stored in **Host RAM** as the Tier-2 payload for that block.
+
+---
+
+### 2.2 Phase 2: Index Distiller (Retrieval Alignment)
+
+**Role:** Retrieval adapter for the memory system.  
+**Goal:** On top of frozen `D`, train a light-weight distiller to resolve the tension between **semantic completeness** and **retrieval geometry**, producing a Tier-1 **index embedding** `H`.
+
+**Asymmetric two-tower structure**
+
+- **Writer tower (Index Distiller):**
+  - **Input:** frozen Detail Tokens `D` from Phase 1
+  - **Architecture:** Tiny Transformer (2–4 layers)
+  - **Trick – Random Token Dropout (input masking):**
+    - During training, randomly mask out **30–50%** of tokens in `D`
+    - Forces the distiller to use **global** information, not overfit to one “golden token”
+  - **Output:** single **Index Embedding** `H` for the block
+
+- **Reader tower (Query Projector):**
+  - **Input:** main LLM hidden state (e.g., when generating a `<RETRIEVE>` token or at a special retrieval step)
+  - **Architecture:** MLP / Mixer
+  - **Output:** single **Query Embedding** `Q`
+
+**Training – Contrastive alignment**
+
+- **Task:** map the **interpretive space** (`D`) to a **metric retrieval space** (`H`, `Q`) suitable for ANN / DNII.
+- **Loss:**  
+  - **InfoNCE** (listwise contrastive loss)  
+  - **No BCE loss** – we want a **well-shaped embedding topology**, not just a “yes/no” classifier.
+
+- **Hard negative mining:**
+  - In each batch, mix blocks that:
+    - Look **semantically close** (same topic / entity)
+    - But are **logically incompatible** with the query (different version, wrong ID, wrong condition)
+  - These hard negatives are constructed using Phase-1 signals (rationales, tags).
+  - This forces the distiller to preserve the **sharp features** encoded in `D`.
+
+**Result**
+
+- `H` lives in a retrieval-friendly space (HNSW / DNII), while `D` remains a rich, interpretable representation living in Host RAM.
+- At runtime, retrieval is:
+  - `Q` → ANN over `H` → block IDs → load `D` for those blocks.
+
+---
+
+### 2.3 Inference workflow: decoupling speed & understanding
+
+At inference time, the system reuses both phases to decouple **fast retrieval** from **deep understanding**.
+
+**Write path (indexing)**
+
+1. `Block  ->(Frozen Q-Former)->  Detail Tokens D   ->(Save)-> Host RAM (Tier 2)`
+2. `Detail Tokens D  ->(Tiny Transformer)->  Index Embedding H  ->(Save)-> HNSW / DNII (Tier 1)`
+
+- Phase 1 guarantees the **quality & faithfulness** of `D`.
+- Phase 2 guarantees the **retrieval directionality** of `H`.
+
+**Read path (retrieval)**
+
+1. `LLM context  ->(Projector)->  Query embedding Q`
+2. **Search:**  
+   `Q` vs HNSW / DNII over `H` → Top-K block IDs
+3. **Inject:**  
+   Load corresponding Detail Tokens `D` from Host RAM and inject them as a **soft prompt / memory segment** into the current LLM context.
+4. **Generate:**  
+   The LLM generates the final answer, conditioned on these **reasoning-aware Detail Tokens**.
 
 ---
 
@@ -161,37 +252,40 @@ This repo is being built in **phases**, with the explicit goal that **each phase
 
 ---
 
-### 🚧 Phase 2: Block-level Summaries & DNII (Tech Report B)
+### 🚧 Phase 2: Block-level Detail Tokens & Index Distiller (Tech Report B)
 
-- [ ] Train **Q-Former** to produce block summary embeddings:
+- [ ] Train **Q-Former** to produce **Detail Tokens** `D`:
   - Input: block hidden states
-  - Bottleneck: fixed number of latent queries
-  - Training: decode textual summary via a small decoder LoRA (to force non-trivial compression)
-- [ ] Build **DNII** on top of block summaries:
+  - Bottleneck: fixed number of latent queries (e.g. 32)
+  - Training: **Explanation SFT** + auxiliary classification / contrastive losses, so `D` preserves **task-relevant logical features**
+- [ ] Train **Index Distiller** on top of `D`:
+  - Tiny Transformer + random token dropout
+  - Output a single index embedding `H` per block
+- [ ] Build **DNII** on top of `H`:
   - Online clustering / EMA centroids
   - Posting lists, splitting/merging overloaded centroids
   - Two-hop retrieval (Query → Centroids → Blocks)
 - [ ] Train **Query Projector**:
-  - Input: retrieval token hidden state
-  - Loss: InfoNCE (positive block vs negatives)
+  - Input: retrieval token hidden state (or special retrieval step)
+  - Loss: **InfoNCE** (positive block vs hard negatives)
 - [ ] Evaluate:
   - Block recall@K
   - QA accuracy with block-level retrieval
   - Latency vs number of blocks
 
-> Output: **Tech Report B – “Differentiable Neural Inverted Index for Long-Term LLM Memory”**
+> Output: **Tech Report B – “Interpretation-Driven Dual-Phase Encoding and DNII for Long-Term LLM Memory”**
 
 ---
 
 ### 🔭 Phase 3: System integration & cognitive view
 
 - [ ] Wire Phase 1 + Phase 2 into a single **Memory OS**:
-  - Token-level trimmer decides what survives in local KV
-  - Past blocks get summarized → stored as host KV + DNII entry
-  - Retrieval tokens query DNII → fetch blocks back into KV
+  - Token-level Trimmer decides what survives in local KV
+  - Past blocks get summarized → `D` stored as host KV + DNII index `H`
+  - Retrieval tokens query DNII → fetch blocks back via `D` into KV
 - [ ] Add **tools & visualizations**:
   - Memory timeline
-  - Block clustering view
+  - Block clustering view (DNII heads, centroids, posting lists)
   - Retrieval traces (“why did we recall this block?”)
 - [ ] Write an **overview blog post**:
   - The story, design, and lessons learned
@@ -217,5 +311,3 @@ If you are interested in:
 - Or just want to see how far a small **4× MI100** node can go
 
 …then this project is for you 🙂
-
----
