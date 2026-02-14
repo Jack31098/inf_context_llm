@@ -73,16 +73,16 @@ $$
 The system operates as a state machine switching between Content Mode and DSL Mode.
 ```mermaid
 graph TD
-    Start((Start)) --> ContentGen[Content Generation<br/>(Self-Attn, RoPE)]
-    ContentGen --> CheckHead{DSL Activation<br/>Head?}
+    Start((Start)) --> ContentGen["Content Generation<br/>(Self-Attn, RoPE)"]
+    ContentGen --> CheckHead{"DSL Activation<br/>Head?"}
     
     CheckHead -- No --> ContentGen
     CheckHead -- Yes --> PauseContent[Pause Content Stream]
     
-    PauseContent --> InjectKV[Inject Content KV<br/>as Prefix Context (NoPE)]
-    InjectKV --> DSLGen[DSL Generation<br/>(Autoregressive)]
+    PauseContent --> InjectKV["Inject Content KV<br/>as Prefix Context (NoPE)"]
+    InjectKV --> DSLGen["DSL Generation<br/>(Autoregressive)"]
     
-    DSLGen --> CheckEnd{Is [DSL_END]?}
+    DSLGen --> CheckEnd{"Is [DSL_END]?"}
     CheckEnd -- No --> DSLGen
     CheckEnd -- Yes --> ResumeContent[Resume Content Stream]
     ResumeContent --> ContentGen
