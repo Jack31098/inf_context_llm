@@ -88,23 +88,6 @@ graph TD
     ResumeContent --> ContentGen
 ```
 
-```mermaid
-graph TD
-    Start((Start)) --> ContentGen[Content Generation<br/>(Self-Attn, RoPE)]
-    ContentGen --> CheckHead{DSL Activation<br/>Head?}
-    
-    CheckHead -- No --> ContentGen
-    CheckHead -- Yes --> PauseContent[Pause Content Stream]
-    
-    PauseContent --> InjectKV[Inject Content KV<br/>as Prefix Context (NoPE)]
-    InjectKV --> DSLGen[DSL Generation<br/>(Autoregressive)]
-    
-    DSLGen --> CheckEnd{Is [DSL_END]?}
-    CheckEnd -- No --> DSLGen
-    CheckEnd -- Yes --> ResumeContent[Resume Content Stream]
-    ResumeContent --> ContentGen
-```
-
 ### 3.1 Step 1: Content Generation
 - **State:** Active Track = Content. Adapter = LoRA_Content (or None).
 - **Action:** Generate $W$ tokens (a chunk/segment) using standard causal self-attention.
