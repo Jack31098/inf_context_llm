@@ -63,7 +63,7 @@ The DSL Track must attend to both its own history (to maintain syntax) and the C
 **Attention Equation:**
 
 $$
-A_{dsl} = \text{Softmax}\left( [Q_{dsl}K_{dsl}^T \cdot \text{RoPE\_Mask} \parallel Q_{dsl}K_{\text{content\_raw}}^T] \right) \cdot [V_{dsl} \parallel V_{content}]
+A_{dsl} = \text{Softmax}\left( [Q_{dsl}K_{dsl}^T \cdot \mathrm{RoPE\_Mask} \parallel Q_{dsl}K_{\mathrm{content\_raw}}^T] \right) \cdot [V_{dsl} \parallel V_{content}]
 $$
 
 > **Note:** $K_{content\_raw}$ refers to Key vectors before RoPE application, or we must inversely rotate Q to cancel RoPE for the cross-segment. (Engineering decision: likely easier to store non-RoPE keys for cross-attn or use a dedicated projection).
