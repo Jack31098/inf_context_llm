@@ -168,12 +168,16 @@ When `[DSL_START]` is generated, the runtime must determine the content range as
 **Rule:** All content tokens between the previous `[DSL_END]` and the current `[DSL_START]` constitute the content range for the current DSL node.
 
 ```text
-... content tokens ... [DSL_END]  content tokens  [DSL_START] ... dsl tokens ... [DSL_END]  content tokens ...
-                         ↑                            ↑
-                   segment N end              segment N+1 start
-                                    ↑
-                            These content tokens
-                            belong to segment N+1
+Time ----------------------------------------------------------------------->
+
+Track A (Content):   [ Content Segment 1 ]          [ Content Segment 2 ]
+                     ^                   ^          ^                   ^
+                     |___________________|          |___________________|
+                               |                              |
+Track B (DSL):                 |         [DSL Block 1]        |         [DSL Block 2]
+                               |         ^                    |         ^
+                               |_________|                    |_________|
+                               Suffix Binding                 Suffix Binding
 ```
 
 The runtime tracks two state variables:
