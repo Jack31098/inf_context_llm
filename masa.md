@@ -72,6 +72,23 @@ $$
 
 The system operates as a state machine switching between Content Mode and DSL Mode.
 
+```mermaid
+graph TD
+    Start((Start)) --> ContentGen[Content Generation<br/>(Self-Attn, RoPE)]
+    ContentGen --> CheckHead{DSL Activation<br/>Head?}
+    
+    CheckHead -- No --> ContentGen
+    CheckHead -- Yes --> PauseContent[Pause Content Stream]
+    
+    PauseContent --> InjectKV[Inject Content KV<br/>as Prefix Context (NoPE)]
+    InjectKV --> DSLGen[DSL Generation<br/>(Autoregressive)]
+    
+    DSLGen --> CheckEnd{Is [DSL_END]?}
+    CheckEnd -- No --> DSLGen
+    CheckEnd -- Yes --> ResumeContent[Resume Content Stream]
+    ResumeContent --> ContentGen
+```
+
 ### 3.1 Step 1: Content Generation
 - **State:** Active Track = Content. Adapter = LoRA_Content (or None).
 - **Action:** Generate $W$ tokens (a chunk/segment) using standard causal self-attention.
@@ -88,7 +105,7 @@ The system operates as a state machine switching between Content Mode and DSL Mo
 - **State:** Active Track = DSL.
 - **Action:** Autoregressive generation until `[DSL_END]` token.
 - **Input:** `[DSL_START]`.
-- **Context:** Can see all `dsl_kv` + `content_kv` (via NoPE Cross-Attn).
+- **Context:** Can see all `dsl_kv` + `content_kv` (via NoPE Cross-Attn / Prefix Injection).
 - **Storage:** Accumulate `dsl_kv`.
 
 ### 3.4 Step 4: Alignment & Mask Prediction
