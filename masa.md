@@ -60,7 +60,7 @@ The DSL Track must attend to both its own history (to maintain syntax) and the C
     - `content_kv`: Using NoPE (No Positional Encoding).
 - **Rationale:** The relative distance between a DSL token (pos 5) and a Content token (pos 1000) is physically meaningless. We rely purely on Semantic Matching.
 
-**Attention Equation:**
+**Attention Equations:**
 
 $$
 A_{dsl} = \text{Softmax}\left( [Q_{dsl}K_{dsl}^T \cdot \mathrm{RoPE\_Mask} \parallel Q_{dsl}K_{\mathrm{content\_raw}}^T] \right) \cdot [V_{dsl} \parallel V_{content}]
