@@ -142,14 +142,63 @@ The system operates as a state machine switching between Content Mode and DSL Mo
 ## 5. Critical Data Structures
 
 ### 5.1 Alignment Table (Runtime Registry)
-Managed by C++ Runtime, invisible to the LLM.
 
-| DSL Node ID | Content Range (Start, End) | Hidden State Pointer |
-| :--- | :--- | :--- |
-| Node_0 | [0, 64] | ptr_0 |
-| Node_1 | [65, 128] | ptr_1 |
-| ... | ... | ... |
+#### Data Structure Design
 
+```python
+class DSLContentAlignment:
+    segments: List[Segment]
+
+class Segment:
+    dsl_node_id: str          # e.g., "#D1"
+    content_start: int        # content-only token index
+    content_end: int          # content-only token index
+    sequence_start: int       # absolute sequence position (content + DSL mixed)
+    sequence_end: int         # absolute sequence position
+```
+
+#### Automatic Maintenance Logic
+
+This alignment table is maintained automatically by the runtime based on token type (content vs DSL); the model is completely agnostic to its existence.
+
+**Segmentation Logic at DSL Activation**
+
+When `[DSL_START]` is generated, the runtime must determine the content range associated with this DSL node.
+
+**Rule:** All content tokens between the previous `[DSL_END]` and the current `[DSL_START]` constitute the content range for the current DSL node.
+
+```text
+... content tokens ... [DSL_END]  content tokens  [DSL_START] ... dsl tokens ... [DSL_END]  content tokens ...
+                         ↑                            ↑
+                   segment N end              segment N+1 start
+                                    ↑
+                            These content tokens
+                            belong to segment N+1
+```
+
+The runtime tracks two state variables:
+1. `content_token_count`: Global counter for content tokens.
+2. `current_segment_start`: Starting content position of the current segment.
+
+**Pseudocode:**
+
+```python
+content_token_count = 0      # Current segment's content token count
+current_segment_start = 0    # Current segment's start content position
+
+for token in generated_sequence:
+    if token == [DSL_START]:
+        # End of current content segment
+        record_segment(start=current_segment_start,
+                       end=content_token_count)
+        # Enter DSL mode, pause content counting
+
+    elif token == [DSL_END]:
+        # DSL generation finished, new content segment starts
+        current_segment_start = content_token_count
+    elif is_content_token(token):
+        content_token_count += 1
+```
 ### 5.2 KV Cache Memory Layout
 - **Pool A (Content):** Paged Memory. Pages can be evicted to CPU RAM. Indexed by `Content_Pos`.
 - **Pool B (DSL):** Contiguous Memory (Ring Buffer). Always resident in HBM (High priority). Indexed by `DSL_Pos`.
