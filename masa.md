@@ -212,6 +212,137 @@ This is a cheap binary classification task. It catches edge cases where Pass 2's
 4.  **Formatting:** Construct training samples: `<content tokens up to adjusted position> [DSL_START] TYPE | summary [DSL_END]`.
 5.  **Consistency Check:** Use two distinct Oracles (e.g., GPT-5 and Gemini 3 Pro) for Pass 1. Keep only samples where both agree on the `TYPE` and have high semantic similarity in `Summary`. Position adjustment (Pass 2) can use a single Oracle since the task is more deterministic.
 
+### 3.4 Corpus Strategy & Data Pipeline
+
+The quality of Stage A training hinges not on data *volume* but on the **density of cross-temporal semantic events** — situations where RECALL, UPDATE, and CONFLICT naturally arise. Generic web text (Wikipedia, news) is overwhelmingly linear: it produces abundant NEW labels but almost no RECALL/UPDATE/CONFLICT. A deliberate, multi-source corpus strategy is therefore essential.
+
+#### 3.4.1 Design Principle: DSL-Type-Driven Corpus Selection
+
+Each data source is selected for its ability to produce specific DSL types at sufficient density. The target distribution after Oracle annotation is:
+
+| DSL Type | Target Share | Rationale |
+| :--- | :--- | :--- |
+| **NEW** | 40-50% | The most common cognitive event. Easy to source from any text. |
+| **RECALL** | 25-30% | Requires text where past information is re-referenced. Critical for validating cross-attention. |
+| **UPDATE** | 15-20% | Requires text where beliefs/facts change. Under-represented in most corpora. |
+| **CONFLICT** | 5-10% | Rare in natural text. Must be actively sourced or synthesized. |
+
+> **Why not uniform distribution?** The target mirrors real-world deployment frequency. NEW events dominate in practice; training on an artificially uniform distribution would miscalibrate the Activation Head's priors (§5.6). However, RECALL/UPDATE/CONFLICT are under-represented in raw corpora relative to even these targets, so active oversampling is required.
+
+#### 3.4.2 Corpus Composition (Three Tiers)
+
+**Tier 1: Multi-Turn Dialogue (50-60% of training data)**
+
+The primary deployment scenario for MASA. This tier provides the backbone of the training set.
+
+| Source | License | Language | Strengths | DSL Types |
+| :--- | :--- | :--- | :--- | :--- |
+| **WildChat** (~1M conversations) | Open | EN/Multi | Real user-LLM conversations, natural topic drift, preference expression | NEW ✅ RECALL ✅ |
+| **LMSYS-Chat-1M** | Open | EN/Multi | High diversity, multi-turn depth | NEW ✅ RECALL ✅ |
+| **ShareGPT** (filtered) | Open | EN/ZH | Deep multi-turn, complex instructions | NEW ✅ RECALL ✅ |
+| **Synthetic Dialogue** (GPT-5 generated) | Self-owned | Target langs | Controlled density of UPDATE/CONFLICT scenarios | All ✅✅✅ |
+
+**Synthetic Dialogue** is the single most important component for balancing DSL types. Construction prompts should explicitly request:
+- User changes a stated preference or requirement mid-conversation.
+- User corrects a factual claim made earlier.
+- User provides information that contradicts a prior statement.
+- Assistant must reference information from 5+ turns ago.
+
+**Tier 2: Long-Form Narrative (20-30% of training data)**
+
+Novels and scripts are natural treasuries of cross-temporal semantic events — characters reference past events (RECALL), learn new information that revises their understanding (UPDATE), and encounter contradictions (CONFLICT).
+
+| Source | License | Language | Strengths | DSL Types |
+| :--- | :--- | :--- | :--- | :--- |
+| **Project Gutenberg** (~70K books) | Public domain | EN | No copyright risk, classic literature with rich character/plot tracking | RECALL ✅ UPDATE ✅ CONFLICT ✅ |
+| **OpenSubtitles** (movie/TV subtitles) | Open | Multi | Dialogue-heavy, natural RECALL/CONFLICT in plot twists | RECALL ✅ CONFLICT ✅ |
+| **Chinese Web Novels** (public subset) | Varies | ZH | Long-form, high entity density, frequent information updates | NEW ✅ RECALL ✅ UPDATE ✅ |
+| **Screenplays** (public domain / CC) | Varies | EN | Multi-character interaction, scene-crossing references | RECALL ✅ CONFLICT ✅ |
+
+> **Narrative ↔ Dialogue Transfer:** The Activation Head learns *when* to pause and the DSL SFT learns *what* to generate — both capabilities are about information structure, not surface form. A model trained on "character A reveals the true murderer in chapter 10, contradicting the suspect from chapter 3" will transfer to "user changes budget from $2000 to $3500 in turn 8." The Oracle annotation pipeline (§3.3) is format-agnostic: it processes any token stream, regardless of whether it is dialogue or narrative.
+
+**Tier 3: Domain-Specific Supplements (10-20% of training data)**
+
+Targeted sources to boost under-represented DSL types:
+
+| Source | Target DSL Type | Rationale |
+| :--- | :--- | :--- |
+| **ChangeMyView (Reddit)** | CONFLICT | Users explicitly argue opposing positions; replies challenge premises. |
+| **Kialo Debates** | CONFLICT | Structured pro/con argumentation with explicit contradiction. |
+| **AMI / ICSI Meeting Corpus** | UPDATE | Meeting transcripts where decisions are proposed, debated, and revised. |
+| **Wiki Talk Pages** | UPDATE | Editor discussions about factual corrections and content revisions. |
+| **StackOverflow Q&A Threads** | UPDATE | Answers get corrected, updated, or superseded by better solutions. |
+
+#### 3.4.3 Data Pipeline
+
+```text
+                    ┌─────────────┐
+                    │ Raw Corpora  │
+                    │ (§3.4.2)     │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Filtering   │  Length ≥ 2000 tokens, dedup, language filter
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Pass 1      │  Hindsight annotation (§3.3.1)
+                    │  (Oracle A)  │  + Oracle B for consistency check
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Pass 2      │  Causal position adjustment (§3.3.2)
+                    │              │  DISCARD if not causally groundable
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Pass 3      │  Verification (§3.3.3, budget-dependent)
+                    │  (Optional)  │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Type        │  Check DSL type distribution against
+                    │  Balancing   │  §3.4.1 targets. Oversample if needed.
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Formatting  │  Interleaved sequence:
+                    │              │  <content> [DSL_START] TYPE | summary [DSL_END] <content> ...
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Train/Val   │  80/10/10 split, stratified by
+                    │  /Test Split │  DSL type AND source tier
+                    └─────────────┘
+```
+
+#### 3.4.4 Scale Estimates
+
+| Item | Quantity | Notes |
+| :--- | :--- | :--- |
+| Raw text segments | 200K - 500K | Pre-filtering, ≥ 2000 tokens each |
+| Post-annotation samples | 50K - 100K | After Pass 1-3 filtering and consistency check |
+| DSL labels per sample | 3 - 8 (avg ~5) | Depends on text length and information density |
+| Total DSL labels | 250K - 500K | Training signal for both Activation Head and DSL SFT |
+| Oracle annotation cost | ~$2K - $8K | GPT-5 API pricing dependent; Pass 3 optional |
+
+#### 3.4.5 Pilot Protocol (Execute Before Full-Scale Annotation)
+
+Before committing the full Oracle annotation budget, run a small-scale pilot to validate corpus quality and Oracle consistency:
+
+1.  **Sample:** 500 segments from each Tier (1500 total).
+2.  **Annotate:** Full 3-pass Oracle pipeline.
+3.  **Measure:**
+    -   DSL type distribution per source. Does each tier contribute its expected types?
+    -   Inter-Oracle agreement rate (Pass 1 consistency check). Target: ≥ 0.75 Cohen's κ on TYPE.
+    -   Pass 2 DISCARD rate. If > 30% for a source, reconsider its inclusion.
+    -   Average DSL labels per sample. If < 2, the text is too simple; if > 10, the Oracle may be over-annotating.
+4.  **Adjust:** Revise corpus composition ratios based on pilot results before scaling to full annotation.
+
+> **Budget-aware strategy:** If Oracle budget is limited, prioritize Tier 1 (multi-turn dialogue) + synthetic data for full 3-pass annotation, and use Tier 2/3 with 2-pass only (skip Pass 3 verification). The synthetic dialogue data has the highest annotation yield (controlled UPDATE/CONFLICT density) and lowest DISCARD rate (the scenarios are designed to be causally groundable).
+
+---
+
 ## 4. Positional Encoding & KV Cache Design
 
 This is the critical differentiator from standard architectures. The Content stream lives in *sequential time* (token N follows token N-1). The DSL stream lives in *semantic space* (thought node M relates to thought node K by meaning, not by when they were created). We enforce this separation architecturally through independent positional encodings.
