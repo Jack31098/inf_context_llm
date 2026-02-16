@@ -107,46 +107,110 @@ We define only four fundamental cognitive operations to maximize annotation cons
 [DSL_START] CONFLICT | user previously said they prefer cats but now considering a dog [DSL_END]
 ```
 
-### 3.3 Oracle Annotation Pipeline
+### 3.3 Oracle Annotation Pipeline (Two-Pass with Causal Adjustment)
 
-#### Input Format
-The Oracle receives the conversation history (segmented by turns) and the **Existing Memory Index**.
+A naive approach — asking the Oracle to annotate while reading left-to-right — conflates two orthogonal challenges: *what* to annotate and *where* to place it. We decouple them into two passes.
+
+#### 3.3.1 Pass 1: Hindsight Annotation (Content Correctness)
+
+The Oracle reads the **complete** conversation with full hindsight, then generates DSL tags. This maximizes annotation quality: the Oracle knows everything that will happen, so it can produce the most accurate type classification and the most informative summary.
+
+**Input Format:**
 
 ```text
-CONVERSATION SO FAR:
+FULL CONVERSATION:
 [Turn 1] User: ...
 [Turn 1] Assistant: ...
+[Turn 2] User: ...
+[Turn 2] Assistant: ...
+...
+[Turn N] User: ...
 
-CURRENT SEGMENT (to be annotated):
-[Turn 3] User: I actually changed my mind, let's go with the blue one.
-
-EXISTING MEMORY INDEX:
+EXISTING MEMORY INDEX (accumulated so far):
 1. NEW | user wants to redecorate living room
 2. NEW | user prefers red color scheme, dislikes cold tones
 ```
 
-#### Oracle Instructions
+**Oracle Instructions (Pass 1):**
+
 ```text
-Your task: Determine if the CURRENT SEGMENT triggers a memory activation.
+Your task: Read the FULL CONVERSATION and identify all memory activation points.
 
 Rules:
-- Output NONE if the segment is purely transitional, phatic, or contains no memorable information.
-- Output one DSL tag if activation is warranted.
+- For each activation, output one DSL tag with TYPE and summary.
 - Type must be one of: NEW, RECALL, UPDATE, CONFLICT.
 - Summary must be 10-25 tokens, written as a future search query.
-- You may output multiple tags only if the segment contains clearly independent memory events (rare).
+- Include the approximate position (turn number + quote of trigger text).
+- Output NONE for segments that are purely transitional or phatic.
+- You may output multiple tags if the conversation contains independent memory events.
 
-Output format:
+Output format (one per activation):
+Position: [Turn X] "trigger quote..."
 [DSL_START] TYPE | summary text [DSL_END]
-or
-NONE
 ```
 
-#### Data Construction & Quality Control
-1.  **Generation:** Annotate large-scale multi-turn dialogue datasets using the Oracle pipeline.
-2.  **Filtering:** Discard segments labeled `NONE`.
-3.  **Formatting:** Construct training samples: `<content tokens> [DSL_START] TYPE | summary [DSL_END]`.
-4.  **Consistency Check:** Use two distinct Oracles (e.g., GPT-5 and Gemini 3 Pro) to annotate the same data. Keep only samples where both agree on the `TYPE` and have high semantic similarity in `Summary`.
+#### 3.3.2 Pass 2: Causal Position Adjustment (Positional Correctness)
+
+Pass 1 annotations are generated with full hindsight, so their positions may suffer from **hindsight bias** — the Oracle may place a tag at a point where an autoregressive model, reading left-to-right, does not yet have sufficient information to trigger it.
+
+Pass 2 takes each annotation from Pass 1 and adjusts its position to the **earliest causally valid location**: the first token after which all information referenced in the DSL summary has appeared in the left-to-right text stream.
+
+**Oracle Instructions (Pass 2):**
+
+```text
+You are given a conversation (with token indices) and a DSL annotation generated
+with full hindsight. Your task: adjust the POSITION of this DSL tag.
+
+Rules:
+- The DSL tag must appear AFTER all content tokens it references or depends on.
+- Move it to the EARLIEST valid position — the first point where a left-to-right
+  reader has sufficient information to generate this exact tag.
+- If the original position is already valid, keep it unchanged.
+- If the annotation references information that is NEVER explicitly stated in the
+  text (i.e., the Oracle inferred it from context but it was not said), mark the
+  annotation as DISCARD — the model cannot be expected to produce it at inference.
+
+CONVERSATION (with token indices):
+[0] The [1] user [2] said ... [142] budget [143] is [144] now [145] $3500 ...
+
+DSL TAG (from Pass 1):
+[DSL_START] UPDATE | budget revised from $2000 to $3500 [DSL_END]
+Original position: after token 98
+
+Output:
+Adjusted position: after token [N]
+Justification: [one sentence explaining why this is the earliest valid position]
+or
+DISCARD
+Justification: [why this annotation cannot be causally grounded]
+```
+
+> **Why two passes?** A single-pass "annotate as you read" approach forces the Oracle to simultaneously judge information sufficiency (hard) and produce high-quality summaries (also hard). Decoupling yields better results on both axes — Pass 1 gets the *content* right with the benefit of hindsight; Pass 2 gets the *position* right with explicit causal reasoning. Pass 2 also serves as a natural filter: annotations that cannot be causally grounded are discarded.
+
+#### 3.3.3 Pass 3: Verification (Optional, Budget-Dependent)
+
+If budget permits, a third Oracle call validates each (adjusted position, DSL tag) pair:
+
+```text
+Given the conversation up to token [N] (inclusive), could a careful reader
+produce the following DSL tag? Answer YES or NO with brief justification.
+
+Conversation up to token [N]:
+[text...]
+
+DSL tag:
+[DSL_START] UPDATE | budget revised from $2000 to $3500 [DSL_END]
+```
+
+This is a cheap binary classification task. It catches edge cases where Pass 2's adjustment was too aggressive (moved the tag too early) or too conservative (left it too late).
+
+#### 3.3.4 Data Construction & Quality Control
+
+1.  **Pass 1:** Annotate large-scale multi-turn dialogue datasets using the hindsight Oracle pipeline.
+2.  **Pass 2:** Run causal position adjustment on each annotation. Discard annotations marked as DISCARD (Oracle inferred content not present in text).
+3.  **Pass 3 (optional):** Verify adjusted positions. Discard annotations that fail verification.
+4.  **Formatting:** Construct training samples: `<content tokens up to adjusted position> [DSL_START] TYPE | summary [DSL_END]`.
+5.  **Consistency Check:** Use two distinct Oracles (e.g., GPT-5 and Gemini 3 Pro) for Pass 1. Keep only samples where both agree on the `TYPE` and have high semantic similarity in `Summary`. Position adjustment (Pass 2) can use a single Oracle since the task is more deterministic.
 
 ## 4. Positional Encoding & KV Cache Design
 
@@ -217,7 +281,7 @@ graph TD
 - **State:** Active Track = Content. Adapter = LoRA_Content (or None).
 - **Action:** Generate $W$ tokens (a chunk/segment) using standard causal self-attention.
 - **Storage:** Accumulate `content_kv`.
-- **Trigger:** Detect Stop Token (e.g., `\n`, `.`, or buffer full) OR `[DSL_START]` predicted by a lightweight activation head — the model has decided it needs to pause and think.
+- **Trigger:** At each natural boundary point (sentence-end punctuation, `\n`, turn-end, or buffer full after $W$ tokens), the **Activation Head** (§5.6) evaluates the frozen base hidden state $h_L$ and outputs $\sigma(\text{logit})$. If this exceeds threshold $\tau$, the model pauses content generation and enters reflection mode (`[DSL_START]`).
 
 ### 5.2 Step 2: Pause (The "Halt")
 - **Action:**
@@ -249,16 +313,177 @@ graph TD
     - **Load:** Load selected `content_kv` pages into HBM (if paged out).
     - **Resume:** Continue Content generation. Position IDs continue from $W+1$. The model now generates with an attention mask shaped by its own reflective reasoning.
 
+### 5.6 Activation Head Design (The "Gatekeeper")
+
+The Activation Head is the mechanism by which the Content stream decides to pause and hand control to the DSL stream. It answers a single binary question at each evaluation point: *"Should I pause here and reflect?"* This section specifies its architecture, training, gradient isolation, and upgrade path.
+
+#### 5.6.1 Design Rationale: Why the Activation Head Lives on the Content Stream
+
+Three candidate placements were considered:
+
+| Placement | Mechanism | Verdict |
+| :--- | :--- | :--- |
+| **Content stream (chosen)** | Lightweight head on content hidden state $h_L^{(t)}$ | ✅ Minimal compute, no circular dependency |
+| DSL stream + KV prefix injection | Inject content KV into DSL, autoregressive decision | ❌ Requires running the full DSL forward pass at every candidate point |
+| DSL stream + cross-attention | DSL cross-attends to content to decide | ❌ Same cost issue; "start the DSL stream to decide whether to start it" is self-referential |
+
+The activation decision is fundamentally about the *content being generated* ("is what I just said worth reflecting on?"), not about the thought stream. Placing the head on the Content stream avoids circular dependencies and keeps inference overhead near zero.
+
+#### 5.6.2 Evaluation Points
+
+The Activation Head is **not** evaluated at every token. It is evaluated only at **natural boundary points** in the content stream:
+
+-   Sentence-ending punctuation (`.`, `!`, `?`)
+-   Newline characters (`\n`)
+-   Turn boundaries (end of a user or assistant turn)
+-   Buffer full (every $W$ tokens if no natural boundary is reached)
+
+This reduces evaluation frequency by ~5-10× compared to per-token evaluation, with negligible impact on activation position accuracy (the Oracle annotation pipeline already places activations at or near natural boundaries in Pass 2).
+
+#### 5.6.3 Architecture: Tiered Design with Experimental Validation
+
+The Activation Head architecture is an open experimental question. We define two tiers, to be selected based on empirical F1 on the validation set.
+
+**Tier 1: MLP Head (Default — Start Here)**
+
+A 2-layer MLP on the final hidden state of the frozen base model at the evaluation point.
+
+```python
+class ActivationHeadMLP(nn.Module):
+    """Tier 1: MLP on last-layer hidden state. ~5M params for d_model=4096."""
+    def __init__(self, d_model: int = 4096, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),      # 4096 → 1024
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 4, d_model // 16), # 1024 → 256
+            nn.GELU(),
+            nn.Linear(d_model // 16, 1),            # 256 → 1
+        )
+
+    def forward(self, h_L: Tensor) -> Tensor:
+        """h_L: (batch, seq_len, d_model) from frozen base. Returns logits (batch, seq_len, 1)."""
+        return self.net(h_L)
+```
+
+-   **Parameters:** ~5M (0.07% of a 7B base).
+-   **Inference cost:** One MLP forward per evaluation point. Sub-microsecond per token on GPU. **Zero state management** — no KV cache required.
+-   **Why 2 layers, not linear?** The activation signal (especially for RECALL/UPDATE/CONFLICT) may not be linearly separable from $h_L$. While $h_L$ provably contains the information (the base model can generate coherent responses that reference past contradictions, proving the signal exists), extracting it for a binary classification may require nonlinear decoding. A 2-layer MLP provides a universal approximation guarantee while remaining trivially cheap.
+
+**Tier 2: Sliding-Window Attention Head (Upgrade if MLP F1 < 0.65)**
+
+If the MLP head cannot achieve adequate F1, the bottleneck is likely not information presence but **extraction efficiency** — the MLP reads only a single position's hidden state, whereas the activation decision (especially for RECALL/CONFLICT) may benefit from explicitly re-comparing the current position with recent history using attention patterns optimized for activation detection (as opposed to the base model's NTP-optimized patterns).
+
+```python
+class ActivationHeadAttn(nn.Module):
+    """Tier 2: Sliding-window attention over projected hidden states. ~8M params."""
+    def __init__(self, d_model: int = 4096, d_inner: int = 256,
+                 n_heads: int = 4, window: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.window = window
+        self.proj_in = nn.Linear(d_model, d_inner)   # 4096 → 256
+        self.attn = nn.MultiheadAttention(d_inner, n_heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_inner, d_inner * 4),          # 256 → 1024
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_inner * 4, 1),                # 1024 → 1
+        )
+
+    def forward(self, h_seq: Tensor) -> Tensor:
+        """h_seq: (batch, seq_len, d_model). Returns logit at last position."""
+        x = self.proj_in(h_seq[:, -self.window:])     # project + truncate to window
+        # Causal self-attention within the window
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(x.size(1), device=x.device)
+        attn_out, _ = self.attn(x, x, x, attn_mask=causal_mask)
+        return self.ffn(attn_out[:, -1:])             # classify last position only
+```
+
+-   **Parameters:** ~8M.
+-   **Key advantage over MLP:** Can learn activation-specific attention patterns to re-compare the current position with recent history. The sliding window (default 128 tokens) avoids maintaining a full KV cache — long-range dependencies are already captured by the base model's 80-layer attention and encoded in $h_L$; the window only needs to detect *local* patterns of topic shift, contradiction, or recurrence.
+-   **When to use:** Only if Tier 1 MLP achieves F1 < 0.65 on the validation set after data optimization (see §5.6.6).
+
+#### 5.6.4 Gradient Isolation
+
+**Critical invariant: The Activation Head must never interfere with the base model or any LoRA adapter.**
+
+In Stage A, the Content stream uses the **frozen base only** (LoRA_Content is not active). Therefore, $h_L$ is produced entirely by frozen parameters, and backpropagation from the Activation Head's loss updates only the head's own parameters. No explicit `detach()` is needed.
+
+If LoRA_Content is activated in future stages, gradient isolation must be enforced:
+
+```python
+# Future-proof: always safe to detach
+h_for_activation = h_L.detach()
+logit = activation_head(h_for_activation)
+loss_act = focal_loss(logit, oracle_labels)
+```
+
+The `detach()` call severs the gradient path from the activation head to any upstream parameters (frozen base or LoRA), ensuring the head is a pure "read-only probe" on the content stream's representation.
+
+#### 5.6.5 Training
+
+-   **Supervision:** Binary labels from the Oracle annotation pipeline (§3.3). A position is labeled `1` if it is a Pass-2 adjusted activation point, `0` otherwise.
+-   **Evaluation points only:** Labels are generated only at natural boundary positions (§5.6.2), not at every token. This naturally aligns with the activation head's evaluation schedule.
+-   **Loss function:** Focal Loss to handle severe class imbalance (activation points are sparse — typically 5-15% of evaluation points).
+
+$$\mathcal{L}_{act} = -\alpha_t (1 - p_t)^\gamma \log(p_t), \quad \alpha = 0.25, \; \gamma = 2.0$$
+
+-   **Training schedule:** The Activation Head is trained **jointly with LoRA_DSL** in Stage A Step 1, but with separate loss terms and no shared gradient paths (§5.6.4). The two losses are summed: $\mathcal{L}_{total} = \mathcal{L}_{DSL} + \lambda_{act} \mathcal{L}_{act}$, where $\lambda_{act}$ is a balancing coefficient (default 1.0).
+-   **Inference threshold:** At inference time, an activation is triggered when $\sigma(\text{logit}) > \tau$. The threshold $\tau$ is a tunable hyperparameter (default 0.5) that directly controls reflection frequency — lower $\tau$ means more frequent reflection (higher recall, lower precision), higher $\tau$ means less frequent reflection (higher precision, lower recall). $\tau$ can be adjusted at inference time without retraining.
+
+#### 5.6.6 Experimental Validation Protocol (Stage A)
+
+The Activation Head architecture is an empirical question, not a theoretical one. The following protocol determines which tier to use:
+
+1.  **Baseline (Week 1-2):** Train Tier 1 MLP head. Evaluate on held-out validation set.
+2.  **Target metrics:**
+    -   **Primary:** F1 score on activation point detection (binary).
+    -   **Secondary:** Per-type recall — what fraction of each activation type (NEW, RECALL, UPDATE, CONFLICT) does the head correctly trigger?
+    -   **Operational:** Precision at chosen threshold $\tau$ (controls false positive rate → wasted DSL generation cycles).
+3.  **Decision tree:**
+
+| MLP F1 | Per-type recall | Action |
+| :--- | :--- | :--- |
+| ≥ 0.70 | All types ≥ 0.60 | ✅ Stay with MLP. Focus on DSL SFT quality. |
+| 0.65 – 0.70 | NEW high, RECALL/CONFLICT low | Try data augmentation first: synthesize more RECALL/CONFLICT examples. Re-evaluate. |
+| < 0.65 | — | **Data intervention:** (a) Add hard negatives (content that looks important but shouldn't trigger). (b) Oversample RECALL/UPDATE/CONFLICT positions 3×. Re-train MLP. |
+| < 0.65 after data fix | — | Upgrade to Tier 2 (sliding-window attention). |
+
+4.  **Ablation (if time permits):** Compare MLP-on-$h_L$ vs. MLP-on-weighted-sum-of-last-4-layers (ELMo-style layer mixing, adds only 4 scalar parameters). If the latter improves F1 by > 3%, adopt it as the default MLP input.
+
+> **Design philosophy:** The Activation Head is a gatekeeper, not a reasoner. A false positive (unnecessary activation) wastes one DSL generation cycle but does not corrupt output quality. A false negative (missed activation) means one fewer thought node but is not catastrophic — subsequent turns may re-trigger. The system is **robust to moderate activation head errors** by design. Engineering effort should be allocated proportionally: Oracle annotation quality and DSL SFT effectiveness are 10× more impactful than activation head architecture.
+
+---
+
 ## 6. Implementation Stages (Detailed)
 
 ### Stage A: DSL SFT & Attention Distillation (The Scaffold)
 - **Goal:** Train the model to (1) learn *when* to pause and reflect (active activation) and (2) produce interpretable thought nodes that correctly attend to relevant content.
-- **Components:** Frozen Base + Trainable LoRA_DSL + Trainable MPN.
-- **Data:** `(Raw_Text, DSL_Sequence)` pairs generated by Oracle (GPT-4o).
+- **Components:** Frozen Base + Trainable LoRA_DSL + Trainable Activation Head + Trainable MPN.
+- **Data:** `(Raw_Text, DSL_Sequence)` pairs generated by Oracle (GPT-4o/GPT-5).
 - **DSL Content:** Explicit Text Summaries (the scaffold — human-readable thoughts).
-- **Step 1: DSL SFT (Learning to Reflect)**
-    - Train LoRA_DSL to generate valid DSL tags and summaries based on content. The model learns the cognitive habit of pausing to crystallize understanding.
-    - **Loss:** NTP on DSL tokens only.
+
+- **Step 1a: Activation Head Training (Learning *When* to Reflect)**
+    - Train the Activation Head (§5.6) to predict, at each natural boundary in the content stream, whether to trigger `[DSL_START]`.
+    - **Architecture:** Tier 1 MLP head on $h_L$ (frozen base output). See §5.6.3 for tier selection criteria.
+    - **Input:** Frozen base hidden state $h_L^{(t)}$ at evaluation points (sentence boundaries, turn boundaries).
+    - **Supervision:** Binary labels from Oracle annotation pipeline (§3.3, Pass 2 adjusted positions).
+    - **Loss:** Focal Loss ($\alpha = 0.25, \gamma = 2.0$) to handle activation sparsity.
+    - **Gradient:** Flows only into Activation Head parameters; base model is frozen, no `detach()` needed in Stage A.
+
+- **Step 1b: DSL Generation SFT (Learning *What* to Reflect)**
+    - Given that an activation has been triggered (ground-truth activation points during training), train LoRA_DSL to generate valid DSL tags (`TYPE | summary`) via autoregressive generation.
+    - **Input:** `[DSL_START]` token, with access to content KV (via NoPE cross-attention or prefix injection) and DSL history KV.
+    - **Loss:** NTP on DSL tokens only (`[DSL_START]` through `[DSL_END]`, inclusive of `[DSL_START]` — so the model also learns the activation boundary in the NTP sense).
+    - **Gradient:** Flows into LoRA_DSL parameters only; base model is frozen.
+
+- **Step 1a + 1b Joint Training:** Steps 1a and 1b can be trained jointly in a single forward pass over the interleaved sequence. The total loss is:
+
+$$\mathcal{L}_{Stage A, Step 1} = \mathcal{L}_{DSL\text{-}NTP} + \lambda_{act} \mathcal{L}_{Activation\text{-}Focal}$$
+
+The two losses update disjoint parameter sets (Activation Head vs. LoRA_DSL) with no shared gradient paths.
+
 - **Step 2: MPN Distillation (Learning to Connect)**
     - Train MPN to predict which thought nodes are semantically relevant to the current reflection — establishing cross-temporal links in the thought graph.
     - **Teacher Signal:** High-attention regions in Full Attention serve as ground truth for which connections the model *should* be making.
@@ -366,6 +591,12 @@ for token in generated_sequence:
 
 - **Risk:** "NoPE" Attention collapse (thought stream fails to ground in content).
     - **Mitigation:** Ensure LoRA_DSL is sufficiently powerful to project Content Semantics into the thought-stream latent space effectively without needing positional cues. Monitor cross-attention entropy during training; if it collapses, introduce auxiliary contrastive loss on thought-content pairs.
+
+- **Risk:** Activation Head insufficient discriminability — the MLP head on $h_L$ may not achieve adequate F1 for RECALL/UPDATE/CONFLICT detection, since these signals require cross-positional comparison that may not be fully linearly decodable from a single hidden state.
+    - **Mitigation:** Tiered architecture design (§5.6.3) with explicit upgrade path: MLP → data augmentation → sliding-window attention. The information is provably present in $h_L$ (the base model can generate responses that acknowledge contradictions), but extraction efficiency may require nonlinear or attention-based decoding. The experimental validation protocol (§5.6.6) provides objective decision criteria.
+
+- **Risk:** Activation Head class imbalance — activation points are sparse (5-15% of evaluation positions), leading to a degenerate classifier that always predicts "no activation."
+    - **Mitigation:** Focal Loss ($\gamma = 2.0$) suppresses easy-negative contribution to the loss. Hard negative mining (content that appears important but should not trigger activation). Oversampling of RECALL/UPDATE/CONFLICT positions. Threshold $\tau$ tunable at inference time independently of training.
 
 - **Risk:** Misinterpretation of project scope — readers may confuse MASA with a long-context solution.
     - **Mitigation:** This document explicitly states (Section 1) that MASA is not about extending context windows. The sparse attention mask is a *consequence* of the model's reflective reasoning, not the primary objective. The primary objective is a mutable, structured thought stream that enables active memory management and latent reasoning.
